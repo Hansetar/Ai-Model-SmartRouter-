@@ -1,0 +1,1147 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ai Model SmartRouter 控制面板</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
+        [v-cloak] { display: none; }
+        .tag { display: inline-block; padding: 1px 6px; border-radius: 4px; font-size: 11px; margin: 1px; cursor: pointer; }
+        .tag-active { background-color: #3b82f6; color: white; }
+        .tag-inactive { background-color: #e5e7eb; color: #6b7280; }
+        .stat-card { background: white; border-radius: 0.5rem; box-shadow: 0 1px 3px rgba(0,0,0,0.1); padding: 1.25rem; }
+        .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.4); z-index: 40; display: flex; align-items: center; justify-content: center; }
+        .modal-content { background: white; border-radius: 0.75rem; box-shadow: 0 20px 60px rgba(0,0,0,0.2); max-width: 700px; width: 95%; max-height: 85vh; overflow-y: auto; }
+        .new-badge { display: inline-block; padding: 0px 5px; border-radius: 3px; font-size: 10px; background-color: #10b981; color: white; margin-left: 4px; animation: pulse 2s infinite; }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
+    </style>
+</head>
+<body class="bg-gray-100">
+<div id="app" v-cloak>
+    <!-- 登录页 -->
+    <div v-if="!isLoggedIn" class="min-h-screen flex items-center justify-center bg-gradient-to-br from-blue-50 to-purple-50">
+        <div class="bg-white rounded-2xl shadow-xl p-8 w-full max-w-md">
+            <div class="text-center mb-8">
+                <div class="w-16 h-16 bg-gradient-to-br from-blue-500 to-purple-600 rounded-xl flex items-center justify-center text-white font-bold text-2xl mx-auto mb-4">SR</div>
+                <h1 class="text-2xl font-bold text-gray-800">Ai Model SmartRouter</h1>
+                <p class="text-sm text-gray-500 mt-1">双模式智能路由插件控制面板</p>
+            </div>
+            <div class="space-y-4">
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-1">管理密码</label>
+                    <input v-model="loginPassword" type="password" placeholder="请输入管理密码"
+                        class="w-full border rounded-lg px-4 py-3 text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                        @keyup.enter="doLogin">
+                </div>
+                <button @click="doLogin" :disabled="loginLoading"
+                    class="w-full bg-gradient-to-r from-blue-500 to-purple-600 text-white rounded-lg px-4 py-3 text-sm font-medium hover:opacity-90 disabled:opacity-50">
+                    {{ loginLoading ? '登录中...' : '登录' }}
+                </button>
+                <p v-if="loginError" class="text-red-500 text-sm text-center">{{ loginError }}</p>
+            </div>
+            <p class="text-xs text-gray-400 text-center mt-6">默认密码: admin</p>
+        </div>
+    </div>
+
+    <!-- 主界面 -->
+    <div v-else>
+        <header class="bg-white shadow-sm border-b">
+            <div class="max-w-7xl mx-auto px-4 py-3 flex items-center justify-between">
+                <div class="flex items-center space-x-3">
+                    <div class="w-10 h-10 bg-gradient-to-br from-blue-500 to-purple-600 rounded-lg flex items-center justify-center text-white font-bold text-lg">SR</div>
+                    <div>
+                        <h1 class="text-xl font-bold text-gray-800">Ai Model SmartRouter</h1>
+                        <p class="text-xs text-gray-500">双模式智能路由插件控制面板 | 货币: {{ cfg.currency || 'CNY' }}</p>
+                    </div>
+                </div>
+                <div class="flex items-center space-x-4">
+                    <span class="text-sm" :class="predictorStatus.is_ready ? 'text-green-600' : 'text-yellow-600'">
+                        <span class="inline-block w-2 h-2 rounded-full mr-1" :class="predictorStatus.is_ready ? 'bg-green-500' : 'bg-yellow-500'"></span>
+                        {{ predictorStatus.is_ready ? '预测引擎就绪' : '预测引擎冷启动中' }}
+                    </span>
+                    <button @click="doLogout" class="text-xs text-gray-500 hover:text-red-500 border rounded px-2 py-1">退出</button>
+                </div>
+            </div>
+            <nav class="max-w-7xl mx-auto px-4 flex space-x-1 overflow-x-auto">
+                <button v-for="tab in tabs" :key="tab.key" @click="activeTab = tab.key"
+                    :class="['px-4 py-2 text-sm font-medium border-b-2 transition-colors whitespace-nowrap',
+                        activeTab === tab.key ? 'border-blue-500 text-blue-600' : 'border-transparent text-gray-500 hover:text-gray-700']">
+                    {{ tab.label }}
+                </button>
+            </nav>
+        </header>
+
+        <main class="max-w-7xl mx-auto px-4 py-6">
+            <!-- 仪表盘 -->
+            <div v-show="activeTab === 'dashboard'">
+                <div class="flex justify-between items-center mb-4">
+                    <div class="flex items-center space-x-2">
+                        <span class="text-sm text-gray-500">统计周期:</span>
+                        <button v-for="p in dashboardPeriods" :key="p.value" @click="dashboardPeriod = p.value; loadDashboard()"
+                            :class="['px-3 py-1 rounded text-sm', dashboardPeriod === p.value ? 'bg-blue-500 text-white' : 'bg-gray-200 text-gray-600 hover:bg-gray-300']">{{ p.label }}</button>
+                    </div>
+                    <button @click="resetStats" class="px-3 py-1.5 bg-red-500 text-white rounded text-sm hover:bg-red-600">清除累计数据</button>
+                </div>
+                <div class="grid grid-cols-1 md:grid-cols-6 gap-4 mb-6">
+                    <div class="stat-card"><div class="text-sm text-gray-500">今日转发次数</div><div class="text-3xl font-bold text-blue-600 mt-2">{{ dashboard.total_interceptions || 0 }}</div></div>
+                    <div class="stat-card"><div class="text-sm text-gray-500">累计花费 ({{ cfg.currency || 'CNY' }})</div><div class="text-3xl font-bold text-orange-600 mt-2">{{ currencySymbol }}{{ (dashboard.saved_cost || 0).toFixed(4) }}</div></div>
+                    <div class="stat-card"><div class="text-sm text-gray-500">输入Token总量</div><div class="text-3xl font-bold text-indigo-600 mt-2">{{ formatTokenCount(dashboard.total_input_tokens || 0) }}</div></div>
+                    <div class="stat-card"><div class="text-sm text-gray-500">输出Token总量</div><div class="text-3xl font-bold text-cyan-600 mt-2">{{ formatTokenCount(dashboard.total_output_tokens || 0) }}</div></div>
+                    <div class="stat-card"><div class="text-sm text-gray-500">平均响应延迟</div><div class="text-3xl font-bold text-green-600 mt-2">{{ (dashboard.avg_latency_ms || 0).toFixed(0) }} ms</div></div>
+                    <div class="stat-card"><div class="text-sm text-gray-500">反馈统计</div><div class="text-3xl font-bold mt-2"><span class="text-green-600">{{ (dashboard.feedback_summary || {}).positive || 0 }}</span> / <span class="text-red-600">{{ (dashboard.feedback_summary || {}).negative || 0 }}</span></div></div>
+                </div>
+                <!-- 各模型 Token 与花费统计 -->
+                <div class="bg-white rounded-lg shadow p-5 mb-6" v-if="dashboard.model_token_stats && dashboard.model_token_stats.length > 0">
+                    <h3 class="text-sm font-semibold mb-3">各模型 Token 用量与花费</h3>
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-sm">
+                            <thead class="bg-gray-50 text-gray-600"><tr>
+                                <th class="px-3 py-2 text-left">模型</th><th class="px-3 py-2 text-left">调用次数</th>
+                                <th class="px-3 py-2 text-left">输入Token</th><th class="px-3 py-2 text-left">输出Token</th>
+                                <th class="px-3 py-2 text-left">总Token</th><th class="px-3 py-2 text-left">花费</th>
+                            </tr></thead>
+                            <tbody>
+                                <tr v-for="m in dashboard.model_token_stats" :key="m.model_name" class="border-b hover:bg-gray-50">
+                                    <td class="px-3 py-2 font-medium">{{ m.model_name }}</td>
+                                    <td class="px-3 py-2">{{ m.total_calls || 0 }}</td>
+                                    <td class="px-3 py-2 text-indigo-600">{{ formatTokenCount(m.total_input_tokens || 0) }}</td>
+                                    <td class="px-3 py-2 text-cyan-600">{{ formatTokenCount(m.total_output_tokens || 0) }}</td>
+                                    <td class="px-3 py-2 font-medium">{{ formatTokenCount((m.total_input_tokens || 0) + (m.total_output_tokens || 0)) }}</td>
+                                    <td class="px-3 py-2 text-orange-600">{{ (m.total_cost || 0).toFixed(4) }} {{ m.cost_currency || '' }}</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+                    <div class="bg-white rounded-lg shadow p-5"><h3 class="text-sm font-semibold mb-3">模型调用占比</h3><div ref="pieChart" style="height: 300px;"></div></div>
+                    <div class="bg-white rounded-lg shadow p-5"><h3 class="text-sm font-semibold mb-3">每日请求量与成本趋势</h3><div ref="lineChart" style="height: 300px;"></div></div>
+                    <div class="bg-white rounded-lg shadow p-5"><h3 class="text-sm font-semibold mb-3">任务类型分布</h3><div ref="taskPieChart" style="height: 300px;"></div></div>
+                </div>
+            </div>
+
+            <!-- 预测引擎 -->
+            <div v-show="activeTab === 'predictor'">
+                <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
+                    <div class="stat-card"><div class="text-sm text-gray-500">引擎状态</div><div class="text-xl font-bold mt-2" :class="predictorStatus.is_ready ? 'text-green-600' : 'text-yellow-600'">{{ predictorStatus.is_ready ? '就绪' : '冷启动中' }}</div></div>
+                    <div class="stat-card"><div class="text-sm text-gray-500">特征提取</div><div class="text-xl font-bold text-blue-600 mt-2">{{ predictorStatus.has_onnx ? 'ONNX' : '哈希降级' }}</div></div>
+                    <div class="stat-card"><div class="text-sm text-gray-500">已训练样本</div><div class="text-xl font-bold text-purple-600 mt-2">{{ predictorStatus.total_trained || 0 }}</div></div>
+                    <div class="stat-card"><div class="text-sm text-gray-500">预测缓存</div><div class="text-xl font-bold text-orange-600 mt-2">{{ predictorStatus.cache_size || 0 }}</div></div>
+                </div>
+                <div class="bg-white rounded-lg shadow p-5 mb-6">
+                    <h3 class="text-lg font-semibold mb-3">模型预测测试</h3>
+                    <p class="text-sm text-gray-500 mb-3">输入 Prompt，查看预测器推荐的模型及候选列表</p>
+                    <div class="flex space-x-2 mb-3">
+                        <input v-model="predictTestPrompt" placeholder="输入测试 Prompt..." class="flex-1 border rounded px-3 py-2 text-sm" @keyup.enter="testPredictModel">
+                        <button @click="testPredictModel" :disabled="predictTestLoading" class="px-4 py-2 bg-blue-500 text-white rounded text-sm hover:bg-blue-600 disabled:opacity-50">{{ predictTestLoading ? '预测中...' : '预测' }}</button>
+                    </div>
+                    <div v-if="predictTestResult" class="space-y-2">
+                        <div class="flex items-center space-x-4 text-sm">
+                            <span>难度: <strong>{{ predictTestResult.difficulty }}</strong></span>
+                            <span>预估Token: <strong>{{ predictTestResult.est_tokens }}</strong></span>
+                            <span>任务类型: <strong>{{ predictTestResult.task_type || '—' }}</strong></span>
+                            <span>推荐模型: <strong class="text-blue-600">{{ predictTestResult.expected_model || '—' }}</strong></span>
+                        </div>
+                        <div v-if="predictTestResult.candidate_models && predictTestResult.candidate_models.length" class="mt-2">
+                            <p class="text-xs text-gray-500 mb-1">候选模型（按综合评分排序）:</p>
+                            <div class="flex flex-wrap gap-2">
+                                <span v-for="(cm, idx) in predictTestResult.candidate_models" :key="cm.name" :class="['px-2 py-1 rounded text-xs', idx === 0 ? 'bg-blue-100 text-blue-800 font-medium' : 'bg-gray-100 text-gray-600']">
+                                    {{ cm.name }} <span class="text-gray-400">(评分:{{ cm.combined_score }})</span>
+                                </span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div class="bg-white rounded-lg shadow p-5 mb-6">
+                    <h3 class="text-lg font-semibold mb-3">任务类型检测器</h3>
+                    <div class="grid grid-cols-2 md:grid-cols-3 gap-3 mb-4">
+                        <div v-for="(w, tt) in taskTypeDetector.weights" :key="tt" class="border rounded p-3">
+                            <div class="flex justify-between text-sm mb-1"><span class="font-medium">{{ tt }}</span><span class="text-gray-500">{{ w.toFixed(2) }}</span></div>
+                            <div class="w-full bg-gray-200 rounded-full h-2"><div class="bg-blue-500 h-2 rounded-full" :style="{ width: Math.min(100, w / 1.5 * 100) + '%' }"></div></div>
+                        </div>
+                    </div>
+                    <p class="text-sm text-gray-500">学习关键词: <span v-for="(c, t) in taskTypeDetector.learned_pattern_counts" :key="t" class="mr-3">{{ t }}: {{ c }}个</span></p>
+                </div>
+
+                <!-- 训练集管理 -->
+                <div class="bg-white rounded-lg shadow p-5 mb-6">
+                    <div class="flex justify-between items-center mb-4">
+                        <h3 class="text-lg font-semibold">训练集管理</h3>
+                        <div class="flex space-x-2">
+                            <select v-model="trainingFilterSource" @change="loadTrainingSamples" class="border rounded px-2 py-1 text-xs">
+                                <option value="">全部来源</option>
+                                <option v-for="s in trainingSources" :key="s.source" :value="s.source">{{ s.source }} ({{ s.count }})</option>
+                            </select>
+                            <button @click="showAddSampleModal = true" class="px-3 py-1.5 bg-blue-500 text-white rounded text-sm hover:bg-blue-600">+ 添加样本</button>
+                            <button @click="showBatchImportModal = true" class="px-3 py-1.5 border border-blue-500 text-blue-500 rounded text-sm hover:bg-blue-50">批量导入</button>
+                            <button @click="retrainFromSamples" :disabled="retraining" class="px-3 py-1.5 bg-purple-500 text-white rounded text-sm hover:bg-purple-600 disabled:opacity-50">{{ retraining ? '重训中...' : '重新训练' }}</button>
+                            <button @click="resetPredictor" class="px-3 py-1.5 bg-red-500 text-white rounded text-sm hover:bg-red-600">重置引擎</button>
+                            <button v-if="selectedSamples.length" @click="batchDeleteSamples" class="px-3 py-1.5 bg-orange-500 text-white rounded text-sm hover:bg-orange-600">删除选中({{ selectedSamples.length }})</button>
+                        </div>
+                    </div>
+                    <div class="text-sm text-gray-500 mb-3">共 {{ trainingTotal }} 条训练样本 <span v-if="selectedSamples.length" class="ml-2 text-blue-600">已选 {{ selectedSamples.length }} 条</span></div>
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-sm">
+                            <thead class="bg-gray-50 text-gray-600">
+                                <tr>
+                                    <th class="px-2 py-2 text-left"><input type="checkbox" @change="toggleAllSamples" :checked="selectedSamples.length === trainingSamples.length && trainingSamples.length > 0" class="w-4 h-4"></th>
+                                    <th class="px-3 py-2 text-left">ID</th>
+                                    <th class="px-3 py-2 text-left">Prompt</th>
+                                    <th class="px-3 py-2 text-left">难度</th>
+                                    <th class="px-3 py-2 text-left">预估Token</th>
+                                    <th class="px-3 py-2 text-left">任务类型</th>
+                                    <th class="px-3 py-2 text-left">指定模型</th>
+                                    <th class="px-3 py-2 text-left">来源</th>
+                                    <th class="px-3 py-2 text-left">状态</th>
+                                    <th class="px-3 py-2 text-left">操作</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr v-for="s in trainingSamples" :key="s.id" class="border-b hover:bg-gray-50">
+                                    <td class="px-2 py-2"><input type="checkbox" :value="s.id" v-model="selectedSamples" class="w-4 h-4"></td>
+                                    <td class="px-3 py-2 text-xs text-gray-400">{{ s.id }}</td>
+                                    <td class="px-3 py-2 text-xs max-w-xs truncate" :title="s.prompt">{{ s.prompt }}</td>
+                                    <td class="px-3 py-2"><span class="font-medium" :class="getDifficultyColor(s.difficulty)">{{ s.difficulty }}</span></td>
+                                    <td class="px-3 py-2 text-xs">{{ s.est_tokens }}</td>
+                                    <td class="px-3 py-2"><span v-if="s.task_type" class="tag tag-active">{{ s.task_type }}</span><span v-else class="text-gray-400">—</span></td>
+                                    <td class="px-3 py-2"><span v-if="s.model_name" class="tag" style="background:#e0e7ff;color:#3730a3;">{{ s.model_name }}</span><span v-else class="text-gray-400">—</span></td>
+                                    <td class="px-3 py-2 text-xs text-gray-500">{{ s.source }}</td>
+                                    <td class="px-3 py-2"><span v-if="s.is_new" class="new-badge">NEW</span><span v-else class="text-xs text-gray-400">已归档</span></td>
+                                    <td class="px-3 py-2">
+                                        <button @click="editSample(s)" class="text-blue-500 hover:underline text-xs mr-1">编辑</button>
+                                        <button @click="deleteSample(s.id)" class="text-red-500 hover:underline text-xs">删除</button>
+                                    </td>
+                                </tr>
+                                <tr v-if="trainingSamples.length === 0"><td colspan="9" class="px-3 py-8 text-center text-gray-400">暂无训练样本</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                    <div v-if="trainingTotal > trainingPageSize" class="flex justify-center items-center mt-4 space-x-2">
+                        <button @click="trainingPage > 1 && (trainingPage--, loadTrainingSamples())" :disabled="trainingPage <= 1" class="px-3 py-1 border rounded text-sm disabled:opacity-50">上一页</button>
+                        <span class="text-sm text-gray-500">{{ trainingPage }} / {{ Math.ceil(trainingTotal / trainingPageSize) }}</span>
+                        <button @click="trainingPage * trainingPageSize < trainingTotal && (trainingPage++, loadTrainingSamples())" :disabled="trainingPage * trainingPageSize >= trainingTotal" class="px-3 py-1 border rounded text-sm disabled:opacity-50">下一页</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 模型管理 -->
+            <div v-show="activeTab === 'models'">
+                <div class="bg-white rounded-lg shadow p-5">
+                    <div class="flex justify-between items-center mb-4">
+                        <h3 class="text-lg font-semibold">模型列表</h3>
+                        <div class="flex space-x-2">
+                            <button @click="syncPrices" :disabled="syncingPrices" class="px-3 py-1.5 border border-green-500 text-green-500 rounded text-sm hover:bg-green-50 disabled:opacity-50">{{ syncingPrices ? '同步中...' : '同步价格' }}</button>
+                            <button @click="saveModels" class="px-3 py-1.5 bg-blue-500 text-white rounded text-sm hover:bg-blue-600">保存配置</button>
+                        </div>
+                    </div>
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-sm">
+                            <thead class="bg-gray-50 text-gray-600">
+                                <tr>
+                                    <th class="px-2 py-2 text-left">名称</th><th class="px-2 py-2 text-left">API类型</th>
+                                    <th class="px-2 py-2 text-left">Base URL</th><th class="px-2 py-2 text-left">参数量(B)</th>
+                                    <th class="px-2 py-2 text-left">能力</th><th class="px-2 py-2 text-left">适合任务</th>
+                                    <th class="px-2 py-2 text-left">输入价格</th><th class="px-2 py-2 text-left">输出价格</th>
+                                    <th class="px-2 py-2 text-left">API Key</th><th class="px-2 py-2 text-left">余额</th><th class="px-2 py-2 text-left">操作</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr v-for="(m, i) in models" :key="i" class="border-b hover:bg-gray-50">
+                                    <td class="px-2 py-2"><input v-model="m.name" class="border rounded px-2 py-1 w-28 text-xs"></td>
+                                    <td class="px-2 py-2">
+                                        <select v-model="m.api_type" class="border rounded px-1 py-1 text-xs">
+                                            <option>openai</option><option>deepseek</option><option>zhipu</option><option>siliconflow</option><option>aliyun</option><option>local</option>
+                                        </select>
+                                    </td>
+                                    <td class="px-2 py-2"><input v-model="m.base_url" placeholder="https://api.xxx.com/v1" class="border rounded px-2 py-1 w-44 text-xs"></td>
+                                    <td class="px-2 py-2"><input type="number" v-model.number="m.params_b" min="0" step="1" @input="onParamsBChange(m)" class="border rounded px-2 py-1 w-16 text-xs"></td>
+                                    <td class="px-2 py-2">
+                                        <div class="flex items-center space-x-1">
+                                            <span class="text-xs font-medium" :class="getCapabilityColor(m.capability)">{{ m.capability || '-' }}</span>
+                                            <label class="flex items-center"><input type="checkbox" v-model="m.capability_manual" @change="onCapabilityManualChange(m)" class="w-3 h-3"><span class="text-xs text-gray-400 ml-0.5">手动</span></label>
+                                            <input v-if="m.capability_manual" type="number" v-model.number="m.capability" min="1" max="5" class="border rounded px-1 py-0.5 w-10 text-xs">
+                                        </div>
+                                    </td>
+                                    <td class="px-2 py-2" style="min-width: 140px;">
+                                        <div class="flex flex-wrap">
+                                            <span v-for="tt in allTaskTypes" :key="tt" @click="toggleTaskType(m, tt)"
+                                                :class="['tag', (m.task_types || []).includes(tt) ? 'tag-active' : 'tag-inactive']">{{ tt }}</span>
+                                        </div>
+                                    </td>
+                                    <td class="px-2 py-2">
+                                        <input type="number" step="0.00001" v-model.number="m.price_input" class="border rounded px-2 py-1 w-20 text-xs">
+                                        <select v-model="m.price_currency" class="border rounded px-1 py-0.5 text-xs ml-1">
+                                            <option value="USD">USD</option><option value="CNY">CNY</option><option value="EUR">EUR</option><option value="JPY">JPY</option><option value="GBP">GBP</option><option value="KRW">KRW</option>
+                                        </select>
+                                        <div class="flex items-center mt-1">
+                                            <span class="text-xs text-gray-400">/</span>
+                                            <select v-model="m.price_unit" class="border rounded px-1 py-0.5 text-xs ml-0.5">
+                                                <option value="1K">1K</option><option value="1M">1M</option><option value="1B">1B</option>
+                                            </select>
+                                            <label class="flex items-center ml-2"><input type="checkbox" v-model="m.price_frozen" class="w-3 h-3"><span class="text-xs text-gray-400 ml-0.5">冻结</span></label>
+                                        </div>
+                                    </td>
+                                    <td class="px-2 py-2">
+                                        <input type="number" step="0.00001" v-model.number="m.price_output" class="border rounded px-2 py-1 w-20 text-xs">
+                                        <span class="text-xs text-gray-400">/{{ m.price_currency || 'USD' }}/{{ m.price_unit || '1M' }}</span>
+                                    </td>
+                                    <td class="px-2 py-2"><input v-model="m.api_key" type="password" placeholder="sk-..." class="border rounded px-2 py-1 w-28 text-xs"></td>
+                                    <td class="px-2 py-2">
+                                        <div class="text-xs text-gray-500 mb-1">{{ m.balance !== null && m.balance !== undefined ? currencySymbol + m.balance.toFixed(4) : '—' }}</div>
+                                        <div class="flex items-center space-x-1">
+                                            <input type="number" step="0.01" v-model.number="m.balance_manual" placeholder="手动余额" class="border rounded px-1 py-0.5 w-16 text-xs" :title="'手动设定余额，留空则自动查询'">
+                                            <select v-model="m.balance_currency" class="border rounded px-1 py-0.5 text-xs">
+                                                <option value="USD">USD</option><option value="CNY">CNY</option><option value="EUR">EUR</option><option value="JPY">JPY</option><option value="GBP">GBP</option><option value="KRW">KRW</option>
+                                            </select>
+                                            <label class="flex items-center ml-1" title="冻结余额，不再动态更新"><input type="checkbox" v-model="m.balance_frozen" class="w-3 h-3"><span class="text-xs text-gray-400 ml-0.5">冻</span></label>
+                                        </div>
+                                    </td>
+                                    <td class="px-2 py-2">
+                                        <label class="flex items-center mb-1"><input type="checkbox" v-model="m.enabled" class="w-3 h-3"><span class="text-xs ml-1" :class="m.enabled ? 'text-green-600' : 'text-red-500'">{{ m.enabled ? '启用' : '禁用' }}</span></label>
+                                        <div class="flex space-x-1">
+                                            <button @click="testModel(m.name)" class="text-blue-500 hover:underline text-xs">测试</button>
+                                            <button @click="cloneModel(m.name)" class="text-green-500 hover:underline text-xs">克隆</button>
+                                            <button @click="showModelConfig(m.name)" class="text-purple-500 hover:underline text-xs">配置</button>
+                                            <button @click="removeModel(i)" class="text-red-500 hover:underline text-xs">删除</button>
+                                        </div>
+                                    </td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                    <button @click="addModel" class="mt-4 px-4 py-2 border-2 border-dashed border-gray-300 rounded text-gray-500 hover:border-blue-400 hover:text-blue-500 text-sm w-full">+ 添加模型</button>
+                </div>
+            </div>
+
+            <!-- 调用统计 -->
+            <div v-show="activeTab === 'stats'">
+                <div class="bg-white rounded-lg shadow p-5">
+                    <h3 class="text-lg font-semibold mb-3">调用统计详情</h3>
+                    <div ref="statsChart" style="height: 400px;"></div>
+                </div>
+                <div class="bg-white rounded-lg shadow p-5 mt-6">
+                    <h3 class="text-lg font-semibold mb-3">模型聚合指标</h3>
+                    <table class="w-full text-sm">
+                        <thead class="bg-gray-50 text-gray-600"><tr>
+                            <th class="px-3 py-2 text-left">模型</th><th class="px-3 py-2 text-left">总调用</th>
+                            <th class="px-3 py-2 text-left">成功率</th><th class="px-3 py-2 text-left">满意度</th>
+                            <th class="px-3 py-2 text-left">正向反馈</th><th class="px-3 py-2 text-left">负向反馈</th>
+                            <th class="px-3 py-2 text-left">最近余额</th>
+                        </tr></thead>
+                        <tbody>
+                            <tr v-for="m in allMetrics" :key="m.model_name" class="border-b hover:bg-gray-50">
+                                <td class="px-3 py-2 font-medium">{{ m.model_name }}</td>
+                                <td class="px-3 py-2">{{ m.total_calls || 0 }}</td>
+                                <td class="px-3 py-2"><span :class="m.success_rate >= 0.9 ? 'text-green-600' : 'text-orange-600'">{{ ((m.success_rate || 0) * 100).toFixed(1) }}%</span></td>
+                                <td class="px-3 py-2"><span :class="m.satisfaction_rate >= 0.8 ? 'text-green-600' : 'text-orange-600'">{{ ((m.satisfaction_rate || 0) * 100).toFixed(1) }}%</span></td>
+                                <td class="px-3 py-2 text-green-600">{{ m.positive_feedback || 0 }}</td>
+                                <td class="px-3 py-2 text-red-600">{{ m.negative_feedback || 0 }}</td>
+                                <td class="px-3 py-2">{{ m.last_balance !== null && m.last_balance !== undefined ? currencySymbol + m.last_balance.toFixed(4) : '—' }}</td>
+                            </tr>
+                            <tr v-if="allMetrics.length === 0"><td colspan="7" class="px-3 py-8 text-center text-gray-400">暂无数据</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- 反馈中心 -->
+            <div v-show="activeTab === 'feedback'">
+                <div class="bg-white rounded-lg shadow p-5">
+                    <h3 class="text-lg font-semibold mb-3">不认可对话详情（人工复盘）</h3>
+                    <div class="space-y-3">
+                        <div v-for="item in negativeFeedback" :key="item.id" class="border rounded-lg p-4 bg-red-50">
+                            <div class="flex justify-between text-xs text-gray-500 mb-2">
+                                <span>模型: {{ item.routed_model || '未知' }}</span>
+                                <span>{{ new Date(item.timestamp * 1000).toLocaleString() }}</span>
+                            </div>
+                            <div class="text-sm text-gray-700 bg-white p-3 rounded">{{ item.context_snapshot || '（无上下文快照）' }}</div>
+                        </div>
+                        <div v-if="negativeFeedback.length === 0" class="text-center text-gray-400 py-8">暂无不认可反馈</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 路由日志 -->
+            <div v-show="activeTab === 'route-logs'">
+                <div class="bg-white rounded-lg shadow p-5 mb-6">
+                    <div class="flex justify-between items-center mb-4">
+                        <h3 class="text-lg font-semibold">路由日志</h3>
+                        <div class="flex space-x-2">
+                            <select v-model="routeLogFilterModel" @change="loadRouteLogs" class="border rounded px-2 py-1 text-xs">
+                                <option value="">全部模型</option>
+                                <option v-for="m in models" :key="m.name" :value="m.name">{{ m.name }}</option>
+                            </select>
+                            <select v-model="routeLogFilterSource" @change="loadRouteLogs" class="border rounded px-2 py-1 text-xs">
+                                <option value="">全部来源</option>
+                                <option value="auto">智能路由</option>
+                                <option value="direct">直连</option>
+                                <option value="cache">缓存</option>
+                                <option value="fallback">降级</option>
+                                <option value="keyword">关键词</option>
+                            </select>
+                            <button @click="loadRouteLogs" class="px-3 py-1.5 border border-gray-400 text-gray-600 rounded text-sm hover:bg-gray-50">刷新</button>
+                            <button @click="clearRouteLogs" class="px-3 py-1.5 bg-red-500 text-white rounded text-sm hover:bg-red-600">清除日志</button>
+                        </div>
+                    </div>
+                    <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4">
+                        <div class="stat-card"><div class="text-sm text-gray-500">总日志数</div><div class="text-2xl font-bold text-blue-600 mt-1">{{ routeLogStats.total_logs || 0 }}</div></div>
+                        <div class="stat-card"><div class="text-sm text-gray-500">智能路由</div><div class="text-2xl font-bold text-green-600 mt-1">{{ (routeLogStats.source_distribution || []).find(s => s.route_source === 'auto')?.count || 0 }}</div></div>
+                        <div class="stat-card"><div class="text-sm text-gray-500">直连调用</div><div class="text-2xl font-bold text-orange-600 mt-1">{{ (routeLogStats.source_distribution || []).find(s => s.route_source === 'direct')?.count || 0 }}</div></div>
+                        <div class="stat-card"><div class="text-sm text-gray-500">降级路由</div><div class="text-2xl font-bold text-red-600 mt-1">{{ (routeLogStats.source_distribution || []).find(s => s.route_source === 'fallback')?.count || 0 }}</div></div>
+                    </div>
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-sm">
+                            <thead class="bg-gray-50 text-gray-600">
+                                <tr>
+                                    <th class="px-3 py-2 text-left">时间</th>
+                                    <th class="px-3 py-2 text-left">路由来源</th>
+                                    <th class="px-3 py-2 text-left">请求模型</th>
+                                    <th class="px-3 py-2 text-left">路由模型</th>
+                                    <th class="px-3 py-2 text-left">Prompt预览</th>
+                                    <th class="px-3 py-2 text-left">难度</th>
+                                    <th class="px-3 py-2 text-left">类型</th>
+                                    <th class="px-3 py-2 text-left">花费</th>
+                                    <th class="px-3 py-2 text-left">延迟</th>
+                                    <th class="px-3 py-2 text-left">状态</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr v-for="log in routeLogs" :key="log.id" class="border-b hover:bg-gray-50">
+                                    <td class="px-3 py-2 text-xs text-gray-500">{{ log.timestamp ? new Date(log.timestamp * 1000).toLocaleString() : '—' }}</td>
+                                    <td class="px-3 py-2"><span :class="getRouteSourceStyle(log.route_source)">{{ getRouteSourceLabel(log.route_source) }}</span></td>
+                                    <td class="px-3 py-2 text-xs">{{ log.requested_model || 'auto' }}</td>
+                                    <td class="px-3 py-2 text-xs font-medium">{{ log.routed_model }}</td>
+                                    <td class="px-3 py-2 text-xs max-w-xs truncate" :title="log.prompt_preview">{{ log.prompt_preview || '—' }}</td>
+                                    <td class="px-3 py-2 text-xs">{{ log.predicted_difficulty }}→{{ log.actual_difficulty }}</td>
+                                    <td class="px-3 py-2"><span v-if="log.task_type" class="tag tag-active">{{ log.task_type }}</span><span v-else class="text-gray-400">—</span></td>
+                                    <td class="px-3 py-2 text-xs">{{ log.cost ? log.cost.toFixed(4) : '0' }} {{ log.cost_currency || '' }}</td>
+                                    <td class="px-3 py-2 text-xs">{{ log.latency_ms }}ms</td>
+                                    <td class="px-3 py-2" :class="log.success ? 'text-green-600' : 'text-red-600'">{{ log.success ? '成功' : '失败' }}</td>
+                                </tr>
+                                <tr v-if="routeLogs.length === 0"><td colspan="10" class="px-3 py-8 text-center text-gray-400">暂无路由日志</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                    <div v-if="routeLogTotal > routeLogPageSize" class="flex justify-center items-center mt-4 space-x-2">
+                        <button @click="routeLogPage > 1 && (routeLogPage--, loadRouteLogs())" :disabled="routeLogPage <= 1" class="px-3 py-1 border rounded text-sm disabled:opacity-50">上一页</button>
+                        <span class="text-sm text-gray-500">{{ routeLogPage }} / {{ Math.ceil(routeLogTotal / routeLogPageSize) }}</span>
+                        <button @click="routeLogPage * routeLogPageSize < routeLogTotal && (routeLogPage++, loadRouteLogs())" :disabled="routeLogPage * routeLogPageSize >= routeLogTotal" class="px-3 py-1 border rounded text-sm disabled:opacity-50">下一页</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 路由测试 -->
+            <div v-show="activeTab === 'route-test'">
+                <div class="bg-white rounded-lg shadow p-5 mb-6">
+                    <h3 class="text-lg font-semibold mb-4">准备模型 / 自动路由测试</h3>
+                    <p class="text-sm text-gray-500 mb-4">输入 Prompt，系统将预测难度和任务类型，并返回推荐的模型路由结果。API 调用时设置 <code class="bg-gray-100 px-1 rounded">model="auto"</code> 启用智能路由模式，设置具体模型名则直连该模型。</p>
+                    <div class="space-y-4">
+                        <div>
+                            <label class="block text-sm text-gray-600 mb-1">输入 Prompt</label>
+                            <textarea v-model="routeTestPrompt" rows="4" placeholder="请输入要测试的 Prompt，例如：帮我写一个 Python 快速排序算法" class="w-full border rounded-lg px-4 py-3 text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500"></textarea>
+                        </div>
+                        <div>
+                            <label class="block text-sm text-gray-600 mb-1">指定模型（可选，留空或填 auto 则智能路由）</label>
+                            <input v-model="routeTestModel" placeholder="auto 或具体模型名，留空=智能路由" class="w-full border rounded-lg px-4 py-2 text-sm">
+                        </div>
+                        <button @click="testRoute" :disabled="routeTestLoading" class="px-6 py-2 bg-gradient-to-r from-blue-500 to-purple-600 text-white rounded-lg text-sm font-medium hover:opacity-90 disabled:opacity-50">
+                            {{ routeTestLoading ? '测试中...' : '测试路由' }}
+                        </button>
+                    </div>
+                </div>
+                <div v-if="routeTestResult" class="bg-white rounded-lg shadow p-5">
+                    <h3 class="text-lg font-semibold mb-4">路由结果</h3>
+                    <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+                        <div class="stat-card"><div class="text-sm text-gray-500">预测难度</div><div class="text-2xl font-bold mt-1" :class="getDifficultyColor(routeTestResult.predicted_difficulty)">{{ routeTestResult.predicted_difficulty }} / 5</div></div>
+                        <div class="stat-card"><div class="text-sm text-gray-500">预估Token</div><div class="text-2xl font-bold text-blue-600 mt-1">{{ routeTestResult.estimated_tokens }}</div></div>
+                        <div class="stat-card"><div class="text-sm text-gray-500">任务类型</div><div class="text-2xl font-bold text-purple-600 mt-1">{{ routeTestResult.task_type || '通用' }}</div></div>
+                        <div class="stat-card"><div class="text-sm text-gray-500">路由来源</div><div class="text-2xl font-bold mt-1" :class="routeTestResult.route_source === 'auto' ? 'text-green-600' : 'text-orange-600'">{{ getRouteSourceLabel(routeTestResult.route_source) }}</div></div>
+                    </div>
+                    <div v-if="routeTestResult.model_info" class="border rounded-lg p-4">
+                        <h4 class="text-sm font-semibold mb-3">推荐模型: <span class="text-blue-600">{{ routeTestResult.recommended_model }}</span></h4>
+                        <div class="grid grid-cols-2 md:grid-cols-3 gap-3 text-sm">
+                            <div><span class="text-gray-500">API类型:</span> <span class="font-medium">{{ routeTestResult.model_info.api_type }}</span></div>
+                            <div><span class="text-gray-500">能力等级:</span> <span class="font-medium" :class="getCapabilityColor(routeTestResult.model_info.capability)">{{ routeTestResult.model_info.capability }}</span></div>
+                            <div><span class="text-gray-500">输入价格:</span> <span class="font-medium">{{ routeTestResult.model_info.price_input }} /{{ routeTestResult.model_info.price_currency }}/1M</span></div>
+                            <div><span class="text-gray-500">输出价格:</span> <span class="font-medium">{{ routeTestResult.model_info.price_output }} /{{ routeTestResult.model_info.price_currency }}/1M</span></div>
+                            <div class="col-span-2"><span class="text-gray-500">适合任务:</span>
+                                <span v-for="tt in routeTestResult.model_info.task_types" :key="tt" class="tag tag-active ml-1">{{ tt }}</span>
+                                <span v-if="!routeTestResult.model_info.task_types || routeTestResult.model_info.task_types.length === 0" class="text-gray-400">未声明</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 系统配置 -->
+            <div v-show="activeTab === 'config'">
+                <div class="bg-white rounded-lg shadow p-5 mb-6">
+                    <h3 class="text-lg font-semibold mb-4">路由权重配置</h3>
+                    <p class="text-sm text-gray-500 mb-3">双机制路由：预测模型推荐 + 评分选模型。权重之和应为 1.0。用户偏好权重为额外加成，使偏好模型更容易被选中。</p>
+                    <div class="grid grid-cols-2 gap-4 mb-4">
+                        <div>
+                            <label class="block text-sm text-gray-600 mb-1">预测模型推荐权重 (0-1)</label>
+                            <input type="number" step="0.1" min="0" max="1" v-model.number="routeWeightsCfg.predictor_weight" class="border rounded px-3 py-2 w-full text-sm">
+                            <p class="text-xs text-gray-400 mt-1">预测模型根据 Prompt 特征推荐模型的权重，默认 0.5</p>
+                        </div>
+                        <div>
+                            <label class="block text-sm text-gray-600 mb-1">评分选模型权重 (0-1)</label>
+                            <input type="number" step="0.1" min="0" max="1" v-model.number="routeWeightsCfg.score_weight" class="border rounded px-3 py-2 w-full text-sm">
+                            <p class="text-xs text-gray-400 mt-1">综合 cost/reliability/satisfaction 评分的权重，默认 0.5</p>
+                        </div>
+                    </div>
+                    <h4 class="text-sm font-semibold mb-2">用户模型偏好</h4>
+                    <p class="text-xs text-gray-500 mb-2">为特定模型设定偏好权重（0-10），值越大越优先选择。0 表示无偏好。</p>
+                    <div class="space-y-2 mb-3">
+                        <div v-for="m in models" :key="m.name" class="flex items-center space-x-3">
+                            <span class="text-sm w-40 truncate" :title="m.name">{{ m.name }}</span>
+                            <input type="number" step="0.1" min="0" max="10" v-model.number="routeWeightsCfg.model_preferences[m.name]" class="border rounded px-2 py-1 w-20 text-sm" placeholder="0">
+                            <span class="text-xs text-gray-400">偏好权重</span>
+                        </div>
+                    </div>
+                    <button @click="saveRouteWeights" class="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 text-sm">保存路由权重</button>
+                </div>
+
+                <div class="bg-white rounded-lg shadow p-5 mb-6">
+                    <h3 class="text-lg font-semibold mb-4">系统配置</h3>
+                    <div class="grid grid-cols-2 gap-4">
+                        <div><label class="block text-sm text-gray-600 mb-1">默认模型（冷启动降级）</label><input v-model="cfg.default_model" class="border rounded px-3 py-2 w-full text-sm"></div>
+                        <div><label class="block text-sm text-gray-600 mb-1">兜底模型（无法路由时）</label><input v-model="cfg.fallback_model" class="border rounded px-3 py-2 w-full text-sm"></div>
+                        <div><label class="block text-sm text-gray-600 mb-1">Prompt 缓存 TTL (秒)</label><input type="number" v-model.number="cfg.cache_ttl_seconds" class="border rounded px-3 py-2 w-full text-sm"></div>
+                        <div><label class="block text-sm text-gray-600 mb-1">余额缓存 TTL (秒)</label><input type="number" v-model.number="cfg.balance_cache_seconds" class="border rounded px-3 py-2 w-full text-sm"></div>
+                        <div><label class="block text-sm text-gray-600 mb-1">价格同步间隔 (小时)</label><input type="number" v-model.number="cfg.price_sync_interval_hours" class="border rounded px-3 py-2 w-full text-sm"></div>
+                        <div><label class="block text-sm text-gray-600 mb-1">汇率同步间隔 (小时)</label><input type="number" v-model.number="cfg.exchange_rate_sync_interval_hours" class="border rounded px-3 py-2 w-full text-sm"></div>
+                    </div>
+                    <button @click="saveConfig" class="mt-4 px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 text-sm">保存配置</button>
+                </div>
+
+                <div class="bg-white rounded-lg shadow p-5 mb-6">
+                    <h3 class="text-lg font-semibold mb-4">日志管理</h3>
+                    <div class="grid grid-cols-2 gap-4">
+                        <div>
+                            <label class="block text-sm text-gray-600 mb-1">日志保存天数（0=永久保存）</label>
+                            <input type="number" v-model.number="cfg.log_retention_days" min="0" class="border rounded px-3 py-2 w-full text-sm" placeholder="0=永久保存">
+                            <p class="text-xs text-gray-400 mt-1">设置为0表示永久保存日志，设置大于0则自动清除超过天数的日志</p>
+                        </div>
+                        <div>
+                            <label class="block text-sm text-gray-600 mb-1">新增标记持续时间（秒）</label>
+                            <input type="number" v-model.number="cfg.new_mark_ttl_seconds" min="0" class="border rounded px-3 py-2 w-full text-sm" placeholder="3600">
+                            <p class="text-xs text-gray-400 mt-1">训练样本新增标记的显示时长，超时后标记自动消失</p>
+                        </div>
+                    </div>
+                    <button @click="saveConfig" class="mt-4 px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 text-sm">保存日志设置</button>
+                </div>
+
+                <div class="bg-white rounded-lg shadow p-5 mb-6">
+                    <h3 class="text-lg font-semibold mb-4">货币与汇率</h3>
+                    <div class="grid grid-cols-2 gap-4 mb-4">
+                        <div>
+                            <label class="block text-sm text-gray-600 mb-1">显示货币单位</label>
+                            <select v-model="cfg.currency" class="border rounded px-3 py-2 w-full text-sm">
+                                <option value="CNY">人民币 (CNY / ¥)</option>
+                                <option value="USD">美元 (USD / $)</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label class="block text-sm text-gray-600 mb-1">汇率状态</label>
+                            <div class="text-sm text-gray-500 mt-2">
+                                <span v-if="exchangeRateStatus.usd_cny">1 USD = {{ exchangeRateStatus.usd_cny }} CNY</span>
+                                <span v-else class="text-yellow-600">汇率未同步</span>
+                                <span v-if="exchangeRateStatus.last_sync_ago_seconds != null" class="text-xs text-gray-400 ml-2">({{ Math.round(exchangeRateStatus.last_sync_ago_seconds / 60) }}分钟前)</span>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="flex space-x-3">
+                        <button @click="syncExchangeRate" :disabled="syncingExchangeRate" class="px-4 py-2 border border-green-500 text-green-500 rounded hover:bg-green-50 text-sm disabled:opacity-50">{{ syncingExchangeRate ? '同步中...' : '手动同步汇率' }}</button>
+                        <button @click="saveConfig" class="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 text-sm">保存货币设置</button>
+                    </div>
+                </div>
+
+                <div class="bg-white rounded-lg shadow p-5 mb-6">
+                    <h3 class="text-lg font-semibold mb-4">模型名映射（别名）</h3>
+                    <p class="text-sm text-gray-500 mb-3">将请求中的模型名映射为实际模型名，使 OpenClaw 等客户端可以用 gpt-4 等名称连接。</p>
+                    <div class="space-y-2 mb-3">
+                        <div v-for="(target, alias) in modelAliases" :key="alias" class="flex items-center space-x-2">
+                            <input :value="alias" @input="updateAliasKey($event, alias)" placeholder="请求模型名 (如 gpt-4)" class="border rounded px-3 py-1.5 w-48 text-sm">
+                            <span class="text-gray-400">→</span>
+                            <input v-model="modelAliases[alias]" placeholder="实际模型名 (如 deepseek-chat)" class="border rounded px-3 py-1.5 w-48 text-sm">
+                            <button @click="removeAlias(alias)" class="text-red-500 hover:underline text-xs">删除</button>
+                        </div>
+                        <div v-if="Object.keys(modelAliases).length === 0" class="text-sm text-gray-400">暂无映射，点击下方添加</div>
+                    </div>
+                    <div class="flex space-x-3">
+                        <button @click="addAlias" class="px-3 py-1.5 border-2 border-dashed border-gray-300 rounded text-gray-500 hover:border-blue-400 hover:text-blue-500 text-sm">+ 添加映射</button>
+                        <button @click="saveAliases" class="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 text-sm">保存映射</button>
+                    </div>
+                </div>
+
+                <div class="bg-white rounded-lg shadow p-5 mb-6">
+                    <h3 class="text-lg font-semibold mb-4">API Key 认证</h3>
+                    <p class="text-sm text-gray-500 mb-3">设置后，调用 /v1 接口需携带 <code class="bg-gray-100 px-1 rounded">Authorization: Bearer &lt;key&gt;</code>。留空则不启用认证。</p>
+                    <div class="grid grid-cols-2 gap-4">
+                        <div><label class="block text-sm text-gray-600 mb-1">API Key（留空不启用）</label><input v-model="cfg.api_key" type="password" placeholder="sk-your-api-key" class="border rounded px-3 py-2 w-full text-sm"></div>
+                    </div>
+                    <button @click="saveConfig" class="mt-4 px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 text-sm">保存</button>
+                </div>
+
+                <div class="bg-white rounded-lg shadow p-5 mb-6">
+                    <h3 class="text-lg font-semibold mb-4">修改管理密码</h3>
+                    <p class="text-sm text-gray-500 mb-3">Web 设置的密码优先级最高，会覆盖配置文件和环境变量。</p>
+                    <div class="grid grid-cols-2 gap-4">
+                        <div><label class="block text-sm text-gray-600 mb-1">新密码</label><input v-model="newPassword" type="password" placeholder="至少4位" class="border rounded px-3 py-2 w-full text-sm"></div>
+                        <div><label class="block text-sm text-gray-600 mb-1">确认新密码</label><input v-model="confirmPassword" type="password" placeholder="再次输入" class="border rounded px-3 py-2 w-full text-sm"></div>
+                    </div>
+                    <button @click="changePassword" class="mt-4 px-4 py-2 bg-orange-500 text-white rounded hover:bg-orange-600 text-sm">修改密码</button>
+                </div>
+
+                <div class="bg-white rounded-lg shadow p-5 mb-6">
+                    <h3 class="text-lg font-semibold mb-4">SSH Key 管理</h3>
+                    <p class="text-sm text-gray-500 mb-3">设置 SSH 公钥，用于远程访问认证。留空则不启用。</p>
+                    <div>
+                        <label class="block text-sm text-gray-600 mb-1">SSH 公钥</label>
+                        <textarea v-model="sshKeyInput" rows="3" placeholder="ssh-rsa AAAA... user@host" class="w-full border rounded-lg px-3 py-2 text-sm font-mono"></textarea>
+                    </div>
+                    <button @click="changeSshKey" class="mt-4 px-4 py-2 bg-purple-500 text-white rounded hover:bg-purple-600 text-sm">保存 SSH Key</button>
+                </div>
+
+                <div class="bg-white rounded-lg shadow p-5">
+                    <h3 class="text-lg font-semibold mb-4">配置操作</h3>
+                    <div class="flex space-x-4">
+                        <button @click="reloadConfig" class="px-4 py-2 border border-blue-500 text-blue-500 rounded hover:bg-blue-50 text-sm">重新加载配置文件</button>
+                        <button @click="syncPrices" :disabled="syncingPrices" class="px-4 py-2 border border-green-500 text-green-500 rounded hover:bg-green-50 text-sm disabled:opacity-50">{{ syncingPrices ? '同步中...' : '手动同步价格' }}</button>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <!-- 添加/编辑训练样本弹窗 -->
+    <div v-if="showAddSampleModal || showEditSampleModal" class="modal-overlay" @click.self="closeSampleModal">
+        <div class="modal-content p-6">
+            <h3 class="text-lg font-semibold mb-4">{{ showEditSampleModal ? '编辑训练样本' : '添加训练样本' }}</h3>
+            <div class="space-y-4">
+                <div>
+                    <label class="block text-sm text-gray-600 mb-1">Prompt *</label>
+                    <textarea v-model="sampleForm.prompt" rows="4" placeholder="输入训练用的 Prompt 文本" class="w-full border rounded-lg px-3 py-2 text-sm"></textarea>
+                </div>
+                <div class="grid grid-cols-3 gap-4">
+                    <div>
+                        <label class="block text-sm text-gray-600 mb-1">难度 (1-5) *</label>
+                        <input type="number" v-model.number="sampleForm.difficulty" min="1" max="5" class="w-full border rounded px-3 py-2 text-sm">
+                        <div class="flex space-x-1 mt-1">
+                            <span v-for="d in 5" :key="d" @click="sampleForm.difficulty = d" :class="['w-6 h-6 rounded text-xs flex items-center justify-center cursor-pointer', d <= sampleForm.difficulty ? 'bg-blue-500 text-white' : 'bg-gray-200 text-gray-500']">{{ d }}</span>
+                        </div>
+                    </div>
+                    <div>
+                        <label class="block text-sm text-gray-600 mb-1">预估Token</label>
+                        <input type="number" v-model.number="sampleForm.est_tokens" min="1" class="w-full border rounded px-3 py-2 text-sm">
+                    </div>
+                    <div>
+                        <label class="block text-sm text-gray-600 mb-1">任务类型</label>
+                        <select v-model="sampleForm.task_type" class="w-full border rounded px-3 py-2 text-sm">
+                            <option value="">无</option>
+                            <option v-for="tt in allTaskTypes" :key="tt" :value="tt">{{ tt }}</option>
+                        </select>
+                    </div>
+                </div>
+                <div>
+                    <label class="block text-sm text-gray-600 mb-1">指定调用模型</label>
+                    <select v-model="sampleForm.model_name" class="w-full border rounded px-3 py-2 text-sm">
+                        <option value="">自动选择</option>
+                        <option v-for="m in models" :key="m.name" :value="m.name">{{ m.name }}</option>
+                    </select>
+                    <p class="text-xs text-gray-400 mt-1">指定后，训练时该样本会引导路由器优先选择此模型</p>
+                </div>
+                <div v-if="showAddSampleModal">
+                    <label class="block text-sm text-gray-600 mb-1">来源</label>
+                    <input v-model="sampleForm.source" placeholder="manual" class="w-full border rounded px-3 py-2 text-sm">
+                </div>
+            </div>
+            <div class="flex justify-end space-x-3 mt-6">
+                <button @click="closeSampleModal" class="px-4 py-2 border rounded text-sm hover:bg-gray-50">取消</button>
+                <button @click="saveSampleForm" class="px-4 py-2 bg-blue-500 text-white rounded text-sm hover:bg-blue-600">保存</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 批量导入弹窗 -->
+    <div v-if="showBatchImportModal" class="modal-overlay" @click.self="showBatchImportModal = false">
+        <div class="modal-content p-6">
+            <h3 class="text-lg font-semibold mb-4">批量导入训练样本</h3>
+            <p class="text-sm text-gray-500 mb-3">每行一个样本，格式: <code class="bg-gray-100 px-1 rounded">prompt|difficulty|est_tokens|task_type|model_name</code>，其中 est_tokens、task_type、model_name 可选。</p>
+            <div class="space-y-4">
+                <div>
+                    <label class="block text-sm text-gray-600 mb-1">样本数据</label>
+                    <textarea v-model="batchImportText" rows="10" placeholder="帮我写一个Python快速排序|5|800|coding&#10;翻译这段话|2|200|translation&#10;今天天气怎么样|1|100|" class="w-full border rounded-lg px-3 py-2 text-sm font-mono"></textarea>
+                </div>
+                <div>
+                    <label class="block text-sm text-gray-600 mb-1">来源标记</label>
+                    <input v-model="batchImportSource" placeholder="batch_import" class="w-full border rounded px-3 py-2 text-sm">
+                </div>
+            </div>
+            <div class="flex justify-end space-x-3 mt-6">
+                <button @click="showBatchImportModal = false" class="px-4 py-2 border rounded text-sm hover:bg-gray-50">取消</button>
+                <button @click="doBatchImport" class="px-4 py-2 bg-blue-500 text-white rounded text-sm hover:bg-blue-600">导入</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 模型YAML配置弹窗 -->
+    <div v-if="showModelConfigModal" class="modal-overlay" @click.self="showModelConfigModal = false">
+        <div class="modal-content p-6" style="max-width:700px;">
+            <h3 class="text-lg font-semibold mb-4">模型配置 - {{ modelConfigName }}</h3>
+            <p class="text-sm text-gray-500 mb-3">直接编辑该模型的 YAML 配置（JSON 格式）</p>
+            <textarea v-model="modelConfigText" rows="18" class="w-full border rounded-lg px-3 py-2 text-sm font-mono" placeholder="加载中..."></textarea>
+            <div class="flex justify-end space-x-3 mt-4">
+                <button @click="showModelConfigModal = false" class="px-4 py-2 border rounded text-sm hover:bg-gray-50">取消</button>
+                <button @click="saveModelConfig" class="px-4 py-2 bg-blue-500 text-white rounded text-sm hover:bg-blue-600">保存</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Toast -->
+    <div v-if="toast" class="fixed bottom-6 right-6 px-4 py-2 rounded shadow-lg text-white text-sm z-50" :class="toast.type === 'error' ? 'bg-red-500' : 'bg-green-500'">{{ toast.msg }}</div>
+</div>
+
+<script>
+const { createApp, ref, reactive, computed, onMounted, nextTick, watch } = Vue;
+
+createApp({
+    setup() {
+        const tabs = [
+            { key: 'dashboard', label: '仪表盘' },
+            { key: 'predictor', label: '预测引擎' },
+            { key: 'models', label: '模型管理' },
+            { key: 'stats', label: '调用统计' },
+            { key: 'feedback', label: '反馈中心' },
+            { key: 'route-logs', label: '路由日志' },
+            { key: 'route-test', label: '路由测试' },
+            { key: 'config', label: '系统配置' },
+        ];
+        const activeTab = ref('dashboard');
+        const dashboard = ref({});
+        const dashboardPeriod = ref('today');
+        const dashboardPeriods = [
+            { value: 'today', label: '今日' },
+            { value: 'week', label: '本周' },
+            { value: 'month', label: '本月' },
+            { value: 'year', label: '今年' },
+            { value: 'all', label: '全部' },
+        ];
+        const models = ref([]);
+        const allMetrics = ref([]);
+        const negativeFeedback = ref([]);
+        const cfg = reactive({});
+        const predictorStatus = ref({});
+        const taskTypeDetector = ref({});
+        const taskTypeStats = ref([]);
+        const recentTaskTypes = ref([]);
+        const toast = ref(null);
+        const syncingPrices = ref(false);
+        const syncingExchangeRate = ref(false);
+        const exchangeRateStatus = ref({});
+        const modelAliases = reactive({});
+        const allTaskTypes = ['coding', 'math', 'reasoning', 'creative', 'chat', 'translation', 'analysis'];
+
+        const isLoggedIn = ref(false);
+        const loginPassword = ref('');
+        const loginLoading = ref(false);
+        const loginError = ref('');
+        const authToken = ref(localStorage.getItem('smartrouter_token') || '');
+        const newPassword = ref('');
+        const confirmPassword = ref('');
+        const sshKeyInput = ref('');
+
+        const pieChart = ref(null);
+        const lineChart = ref(null);
+        const statsChart = ref(null);
+        const taskPieChart = ref(null);
+        let pieInst = null, lineInst = null, statsInst = null, taskPieInst = null;
+
+        const currencySymbol = computed(() => cfg.currency === 'USD' ? '$' : '¥');
+
+        // 训练集管理状态
+        const trainingSamples = ref([]);
+        const trainingTotal = ref(0);
+        const trainingPage = ref(1);
+        const trainingPageSize = 20;
+        const trainingFilterSource = ref('');
+        const trainingSources = ref([]);
+        const showAddSampleModal = ref(false);
+        const showEditSampleModal = ref(false);
+        const showBatchImportModal = ref(false);
+        const retraining = ref(false);
+        const batchImportText = ref('');
+        const batchImportSource = ref('batch_import');
+        const sampleForm = reactive({ id: null, prompt: '', difficulty: 3, est_tokens: 500, task_type: '', model_name: '', source: 'manual' });
+        const predictTestPrompt = ref('');
+        const predictTestLoading = ref(false);
+        const predictTestResult = ref(null);
+        const selectedSamples = ref([]);
+        const showModelConfigModal = ref(false);
+        const modelConfigName = ref('');
+        const modelConfigText = ref('');
+
+        // 路由测试状态
+        const routeTestPrompt = ref('');
+        const routeTestModel = ref('');
+        const routeTestResult = ref(null);
+        const routeTestLoading = ref(false);
+
+        // 路由日志状态
+        const routeLogs = ref([]);
+        const routeLogTotal = ref(0);
+        const routeLogPage = ref(1);
+        const routeLogPageSize = 20;
+        const routeLogFilterModel = ref('');
+        const routeLogFilterSource = ref('');
+        const routeLogStats = ref({});
+
+        // 路由权重配置
+        const routeWeightsCfg = reactive({ predictor_weight: 0.5, score_weight: 0.5, model_preferences: {} });
+
+        const showToast = (msg, type = 'success') => { toast.value = { msg, type }; setTimeout(() => toast.value = null, 2500); };
+
+        // 智能单位格式化：自动选择 K/M/B
+        const formatTokenCount = (count) => {
+            if (count === null || count === undefined || count === 0) return '0';
+            const abs = Math.abs(count);
+            if (abs >= 1_000_000_000) return (count / 1_000_000_000).toFixed(2) + 'B';
+            if (abs >= 1_000_000) return (count / 1_000_000).toFixed(2) + 'M';
+            if (abs >= 1_000) return (count / 1_000).toFixed(2) + 'K';
+            return String(count);
+        };
+
+        const paramsBToCapability = (paramsB) => { if (!paramsB || paramsB <= 0) return 1; if (paramsB < 1) return 1; if (paramsB < 7) return 2; if (paramsB < 14) return 3; if (paramsB < 70) return 4; return 5; };
+        const getCapabilityColor = (cap) => { if (cap >= 5) return 'text-red-600 font-bold'; if (cap >= 4) return 'text-orange-600'; if (cap >= 3) return 'text-blue-600'; if (cap >= 2) return 'text-green-600'; return 'text-gray-500'; };
+        const getDifficultyColor = (d) => { if (d >= 5) return 'text-red-600 font-bold'; if (d >= 4) return 'text-orange-600'; if (d >= 3) return 'text-blue-600'; if (d >= 2) return 'text-green-600'; return 'text-gray-500'; };
+        const getRouteSourceLabel = (s) => { if (s === 'auto') return '智能路由'; if (s === 'direct') return '直连'; if (s === 'cache') return '缓存'; if (s === 'fallback') return '降级'; if (s === 'keyword') return '关键词'; return s || '未知'; };
+        const getRouteSourceStyle = (s) => { if (s === 'auto') return 'tag tag-active'; if (s === 'direct') return 'tag'; if (s === 'cache') return 'tag'; if (s === 'fallback') return 'tag'; if (s === 'keyword') return 'tag tag-active'; return 'tag'; };
+        const onParamsBChange = (m) => { if (!m.capability_manual) m.capability = paramsBToCapability(m.params_b); };
+        const onCapabilityManualChange = (m) => { if (!m.capability_manual) m.capability = paramsBToCapability(m.params_b); };
+        const toggleTaskType = (m, tt) => { if (!m.task_types) m.task_types = []; const idx = m.task_types.indexOf(tt); if (idx >= 0) m.task_types.splice(idx, 1); else m.task_types.push(tt); };
+
+        const api = async (url, options = {}) => {
+            const headers = { 'Content-Type': 'application/json', ...options.headers };
+            if (authToken.value) headers['Authorization'] = `Bearer ${authToken.value}`;
+            const resp = await fetch(url, { headers, ...options });
+            if (resp.status === 401) { isLoggedIn.value = false; authToken.value = ''; localStorage.removeItem('smartrouter_token'); throw new Error('认证已过期'); }
+            if (!resp.ok) { const data = await resp.json().catch(() => ({})); throw new Error(data.detail || `HTTP ${resp.status}`); }
+            return resp.json();
+        };
+
+        const doLogin = async () => {
+            loginLoading.value = true; loginError.value = '';
+            try {
+                const resp = await fetch('/admin/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: loginPassword.value }) });
+                const data = await resp.json();
+                if (!resp.ok) { loginError.value = data.detail || '登录失败'; return; }
+                authToken.value = data.token; localStorage.setItem('smartrouter_token', data.token);
+                isLoggedIn.value = true; loginPassword.value = ''; await loadAllData();
+            } catch (e) { loginError.value = e.message; } finally { loginLoading.value = false; }
+        };
+        const doLogout = () => { isLoggedIn.value = false; authToken.value = ''; localStorage.removeItem('smartrouter_token'); };
+
+        const loadAllData = async () => {
+            await Promise.all([loadDashboard(), loadModels(), loadConfig(), loadPredictorStatus(), loadMetrics()]);
+            await nextTick(); renderPie(); renderLine(); renderTaskPie();
+        };
+
+        const loadDashboard = async () => { try { dashboard.value = await api(`/admin/api/dashboard?period=${dashboardPeriod.value}`); await nextTick(); renderPie(); renderLine(); renderTaskPie(); } catch (e) { console.error(e); } };
+        const loadModels = async () => { try { const data = await api('/admin/api/models'); models.value = (data.models || []).map(m => ({ ...m, capability_manual: m.capability_manual || false, task_types: m.task_types || [], price_currency: m.price_currency || 'USD', price_unit: m.price_unit || '1M', price_frozen: m.price_frozen || false, balance_manual: m.balance_manual ?? null, balance_currency: m.balance_currency || m.price_currency || 'USD', balance_frozen: m.balance_frozen || false, enabled: m.enabled !== false })); } catch (e) { console.error(e); } };
+        const loadMetrics = async () => { try { const data = await api('/admin/api/metrics'); allMetrics.value = data.metrics || []; } catch (e) { console.error(e); } };
+        const loadNegativeFeedback = async () => { try { const data = await api('/admin/api/feedback/negative'); negativeFeedback.value = data.items || []; } catch (e) { console.error(e); } };
+        const loadConfig = async () => {
+            try {
+                const data = await api('/admin/api/config');
+                Object.assign(cfg, data);
+                Object.keys(modelAliases).forEach(k => delete modelAliases[k]);
+                if (data.model_aliases) Object.assign(modelAliases, data.model_aliases);
+                // 加载路由权重
+                if (data.route_weights) {
+                    routeWeightsCfg.predictor_weight = data.route_weights.predictor_weight ?? 0.5;
+                    routeWeightsCfg.score_weight = data.route_weights.score_weight ?? 0.5;
+                    Object.keys(routeWeightsCfg.model_preferences).forEach(k => delete routeWeightsCfg.model_preferences[k]);
+                    if (data.route_weights.model_preferences) Object.assign(routeWeightsCfg.model_preferences, data.route_weights.model_preferences);
+                }
+                loadExchangeRateStatus();
+                // 加载 SSH Key（脱敏值不回填到输入框）
+                if (data.ssh_key && data.ssh_key !== '***') { sshKeyInput.value = data.ssh_key; }
+                else { sshKeyInput.value = ''; }
+            } catch (e) { console.error(e); }
+        };
+        const loadPredictorStatus = async () => { try { predictorStatus.value = await api('/admin/api/predictor/status'); } catch (e) { console.error(e); } };
+        const loadTaskTypeStats = async () => { try { const data = await api('/admin/api/task-type/stats'); taskTypeStats.value = data.stats || []; taskTypeDetector.value = data.detector || {}; recentTaskTypes.value = data.recent || []; } catch (e) { console.error(e); } };
+
+        const saveModels = async () => { try { await api('/admin/api/models', { method: 'POST', body: JSON.stringify({ models: models.value }) }); showToast('模型配置已保存'); } catch (e) { showToast(e.message, 'error'); } };
+        const saveConfig = async () => { try { await api('/admin/api/config', { method: 'POST', body: JSON.stringify(cfg) }); showToast('系统配置已保存'); } catch (e) { showToast(e.message, 'error'); } };
+        const testModel = async (name) => { try { const data = await api(`/admin/api/models/${encodeURIComponent(name)}/test`, { method: 'POST' }); showToast(`模型 ${name} 余额: ${data.balance !== null && data.balance !== undefined ? currencySymbol.value + data.balance.toFixed(4) : '未知'}`); loadModels(); } catch (e) { showToast(e.message, 'error'); } };
+        const addModel = () => { models.value.push({ name: 'new-model', base_url: '', api_key: '', api_type: 'openai', params_b: 7, capability: 3, capability_manual: false, task_types: ['chat'], price_input: 0, price_output: 0, price_currency: 'CNY', price_unit: '1M', price_frozen: false, balance_manual: null, balance_currency: 'CNY', balance_frozen: false, enabled: true, litellm_name: '' }); };
+        const removeModel = (i) => { models.value.splice(i, 1); };
+        const syncPrices = async () => { syncingPrices.value = true; try { const data = await api('/admin/api/sync-prices', { method: 'POST' }); showToast(`价格同步完成，更新了 ${data.updated_models} 个模型`); loadModels(); loadConfig(); } catch (e) { showToast(e.message, 'error'); } finally { syncingPrices.value = false; } };
+        const reloadConfig = async () => { try { await api('/admin/api/reload-config', { method: 'POST' }); showToast('配置已重新加载'); await loadAllData(); } catch (e) { showToast(e.message, 'error'); } };
+        const changePassword = async () => {
+            if (!newPassword.value || newPassword.value.length < 4) { showToast('密码长度至少4位', 'error'); return; }
+            if (newPassword.value !== confirmPassword.value) { showToast('两次密码不一致', 'error'); return; }
+            try { await api('/admin/api/change-password', { method: 'POST', body: JSON.stringify({ new_password: newPassword.value }) }); showToast('密码已修改，请重新登录'); newPassword.value = ''; confirmPassword.value = ''; doLogout(); } catch (e) { showToast(e.message, 'error'); }
+        };
+        const changeSshKey = async () => {
+            try { await api('/admin/api/change-ssh-key', { method: 'POST', body: JSON.stringify({ ssh_key: sshKeyInput.value }) }); showToast('SSH Key 已保存'); } catch (e) { showToast(e.message, 'error'); }
+        };
+
+        // 汇率与别名
+        const loadExchangeRateStatus = async () => { try { exchangeRateStatus.value = await api('/admin/api/exchange-rate/status'); } catch (e) { console.error(e); } };
+        const syncExchangeRate = async () => { syncingExchangeRate.value = true; try { await api('/admin/api/exchange-rate/sync', { method: 'POST' }); showToast('汇率同步完成'); loadExchangeRateStatus(); } catch (e) { showToast(e.message, 'error'); } finally { syncingExchangeRate.value = false; } };
+        const addAlias = () => { const key = 'new-alias-' + Date.now(); modelAliases[key] = ''; };
+        const removeAlias = (key) => { delete modelAliases[key]; };
+        const updateAliasKey = (event, oldKey) => { const newKey = event.target.value.trim(); if (newKey && newKey !== oldKey) { modelAliases[newKey] = modelAliases[oldKey]; delete modelAliases[oldKey]; } };
+        const saveAliases = async () => { try { await api('/admin/api/config', { method: 'POST', body: JSON.stringify({ model_aliases: { ...modelAliases } }) }); showToast('模型别名已保存'); } catch (e) { showToast(e.message, 'error'); } };
+
+        const saveRouteWeights = async () => {
+            try {
+                // 清理空偏好
+                const prefs = {};
+                for (const [k, v] of Object.entries(routeWeightsCfg.model_preferences)) {
+                    if (v && v > 0) prefs[k] = v;
+                }
+                await api('/admin/api/config', { method: 'POST', body: JSON.stringify({
+                    route_weights: {
+                        predictor_weight: routeWeightsCfg.predictor_weight,
+                        score_weight: routeWeightsCfg.score_weight,
+                        model_preferences: prefs,
+                    }
+                }) });
+                showToast('路由权重已保存');
+            } catch (e) { showToast(e.message, 'error'); }
+        };
+
+        // 训练集管理
+        const loadTrainingSamples = async () => {
+            try {
+                const offset = (trainingPage.value - 1) * trainingPageSize;
+                const params = new URLSearchParams({ limit: String(trainingPageSize), offset: String(offset) });
+                if (trainingFilterSource.value) params.set('source', trainingFilterSource.value);
+                const data = await api(`/admin/api/training-samples?${params}`);
+                trainingSamples.value = data.samples || [];
+                trainingTotal.value = data.total || 0;
+                trainingSources.value = data.sources || [];
+            } catch (e) { console.error(e); }
+        };
+
+        const editSample = (s) => {
+            sampleForm.id = s.id; sampleForm.prompt = s.prompt; sampleForm.difficulty = s.difficulty;
+            sampleForm.est_tokens = s.est_tokens; sampleForm.task_type = s.task_type || '';
+            sampleForm.model_name = s.model_name || ''; sampleForm.source = s.source; showEditSampleModal.value = true;
+        };
+
+        const closeSampleModal = () => {
+            showAddSampleModal.value = false; showEditSampleModal.value = false;
+            sampleForm.id = null; sampleForm.prompt = ''; sampleForm.difficulty = 3;
+            sampleForm.est_tokens = 500; sampleForm.task_type = ''; sampleForm.model_name = ''; sampleForm.source = 'manual';
+        };
+
+        const saveSampleForm = async () => {
+            if (!sampleForm.prompt) { showToast('Prompt 不能为空', 'error'); return; }
+            if (!sampleForm.difficulty || sampleForm.difficulty < 1 || sampleForm.difficulty > 5) { showToast('难度必须为 1-5', 'error'); return; }
+            try {
+                if (showEditSampleModal.value && sampleForm.id) {
+                    await api(`/admin/api/training-samples/${sampleForm.id}`, {
+                        method: 'PUT',
+                        body: JSON.stringify({ prompt: sampleForm.prompt, difficulty: sampleForm.difficulty, est_tokens: sampleForm.est_tokens, task_type: sampleForm.task_type || null, model_name: sampleForm.model_name || null }),
+                    });
+                    showToast('样本已更新');
+                } else {
+                    await api('/admin/api/training-samples', {
+                        method: 'POST',
+                        body: JSON.stringify({ prompt: sampleForm.prompt, difficulty: sampleForm.difficulty, est_tokens: sampleForm.est_tokens, task_type: sampleForm.task_type || null, model_name: sampleForm.model_name || null, source: sampleForm.source || 'manual' }),
+                    });
+                    showToast('样本已添加');
+                }
+                closeSampleModal(); loadTrainingSamples();
+            } catch (e) { showToast(e.message, 'error'); }
+        };
+
+        const deleteSample = async (id) => {
+            if (!confirm('确定删除此训练样本？')) return;
+            try { await api(`/admin/api/training-samples/${id}`, { method: 'DELETE' }); showToast('样本已删除'); loadTrainingSamples(); } catch (e) { showToast(e.message, 'error'); }
+        };
+
+        const doBatchImport = async () => {
+            if (!batchImportText.value.trim()) { showToast('请输入样本数据', 'error'); return; }
+            const lines = batchImportText.value.trim().split('\n').filter(l => l.trim());
+            const samples = lines.map(line => {
+                const parts = line.split('|');
+                return { prompt: (parts[0] || '').trim(), difficulty: parseInt(parts[1]) || 3, est_tokens: parseInt(parts[2]) || 500, task_type: (parts[3] || '').trim() || null, model_name: (parts[4] || '').trim() || null };
+            }).filter(s => s.prompt);
+            if (!samples.length) { showToast('没有有效的样本数据', 'error'); return; }
+            try {
+                const data = await api('/admin/api/training-samples/batch', { method: 'POST', body: JSON.stringify({ samples, source: batchImportSource.value || 'batch_import' }) });
+                showToast(`导入完成: ${data.imported} 条成功${data.errors.length ? '，' + data.errors.length + ' 条失败' : ''}`);
+                showBatchImportModal.value = false; batchImportText.value = ''; loadTrainingSamples();
+            } catch (e) { showToast(e.message, 'error'); }
+        };
+
+        const retrainFromSamples = async () => {
+            retraining.value = true;
+            try { const data = await api('/admin/api/training-samples/retrain', { method: 'POST' }); showToast(`已提交 ${data.queued_samples} 条样本进行重训`); loadPredictorStatus(); } catch (e) { showToast(e.message, 'error'); } finally { retraining.value = false; }
+        };
+
+        const testPredictModel = async () => {
+            if (!predictTestPrompt.value.trim()) { showToast('请输入测试 Prompt', 'error'); return; }
+            predictTestLoading.value = true;
+            try {
+                const data = await api('/admin/api/predictor/test', { method: 'POST', body: JSON.stringify({ prompt: predictTestPrompt.value }) });
+                predictTestResult.value = {
+                    difficulty: data.predicted_difficulty,
+                    est_tokens: data.estimated_tokens,
+                    task_type: data.task_type,
+                    expected_model: data.recommended_model,
+                    candidate_models: data.candidate_models || [],
+                };
+            } catch (e) { showToast(e.message, 'error'); } finally { predictTestLoading.value = false; }
+        };
+
+        const resetPredictor = async () => {
+            if (!confirm('确定重置预测引擎？这将清空所有训练数据和模型权重！')) return;
+            try { const data = await api('/admin/api/predictor/reset', { method: 'POST' }); showToast(data.message || '已重置'); loadPredictorStatus(); loadTrainingSamples(); } catch (e) { showToast(e.message, 'error'); }
+        };
+
+        const toggleAllSamples = (e) => {
+            if (e.target.checked) { selectedSamples.value = trainingSamples.value.map(s => s.id); }
+            else { selectedSamples.value = []; }
+        };
+
+        const batchDeleteSamples = async () => {
+            if (!confirm(`确定删除选中的 ${selectedSamples.value.length} 条样本？`)) return;
+            try { const data = await api('/admin/api/training-samples/batch-delete', { method: 'POST', body: JSON.stringify({ ids: selectedSamples.value }) }); showToast(`已删除 ${data.deleted} 条`); selectedSamples.value = []; loadTrainingSamples(); } catch (e) { showToast(e.message, 'error'); }
+        };
+
+        const cloneModel = async (name) => {
+            const newName = prompt(`克隆模型 ${name}，输入新模型名：`, `${name}-copy`);
+            if (!newName || newName === name) return;
+            try { await api(`/admin/api/models/${encodeURIComponent(name)}/clone`, { method: 'POST', body: JSON.stringify({ new_name: newName }) }); showToast(`已克隆为 ${newName}`); loadModels(); } catch (e) { showToast(e.message, 'error'); }
+        };
+
+        const showModelConfig = async (name) => {
+            modelConfigName.value = name;
+            try { const data = await api(`/admin/api/models/${encodeURIComponent(name)}/config`); modelConfigText.value = JSON.stringify(data.model, null, 2); showModelConfigModal.value = true; } catch (e) { showToast(e.message, 'error'); }
+        };
+
+        const saveModelConfig = async () => {
+            try {
+                const model = JSON.parse(modelConfigText.value);
+                await api(`/admin/api/models/${encodeURIComponent(modelConfigName.value)}/config`, { method: 'PUT', body: JSON.stringify({ model }) });
+                showToast('配置已保存'); showModelConfigModal.value = false; loadModels();
+            } catch (e) { showToast(e.message || 'JSON 格式错误', 'error'); }
+        };
+
+        // 路由日志
+        const loadRouteLogs = async () => {
+            try {
+                const offset = (routeLogPage.value - 1) * routeLogPageSize;
+                const params = new URLSearchParams({ limit: String(routeLogPageSize), offset: String(offset) });
+                if (routeLogFilterModel.value) params.set('model', routeLogFilterModel.value);
+                if (routeLogFilterSource.value) params.set('route_source', routeLogFilterSource.value);
+                const data = await api(`/admin/api/route-logs?${params}`);
+                routeLogs.value = data.logs || [];
+                routeLogTotal.value = data.total || 0;
+                routeLogStats.value = data.stats || {};
+            } catch (e) { console.error(e); }
+        };
+
+        const clearRouteLogs = async () => {
+            const days = cfg.log_retention_days;
+            if (days > 0) {
+                if (!confirm(`确定清除超过 ${days} 天的日志？`)) return;
+            } else {
+                if (!confirm('确定清除所有路由日志？此操作不可恢复！')) return;
+            }
+            try {
+                const params = days > 0 ? `?max_age_days=${days}` : '';
+                const data = await api(`/admin/api/route-logs${params}`, { method: 'DELETE' });
+                showToast(`已清除 ${data.deleted} 条日志`);
+                loadRouteLogs();
+            } catch (e) { showToast(e.message, 'error'); }
+        };
+
+        const resetStats = async () => {
+            if (!confirm('确定清除所有累计统计数据？此操作将归零所有统计，不可恢复！')) return;
+            try {
+                const data = await api('/admin/api/reset-stats', { method: 'POST' });
+                showToast(`累计数据已归零，清除了 ${data.logs_deleted} 条日志`);
+                loadDashboard();
+            } catch (e) { showToast(e.message, 'error'); }
+        };
+
+        // 路由测试
+        const testRoute = async () => {
+            if (!routeTestPrompt.value.trim()) { showToast('请输入 Prompt', 'error'); return; }
+            routeTestLoading.value = true; routeTestResult.value = null;
+            try {
+                const body = { prompt: routeTestPrompt.value };
+                if (routeTestModel.value.trim()) body.model = routeTestModel.value.trim();
+                const data = await api('/admin/api/predictor/test', { method: 'POST', body: JSON.stringify(body) });
+                routeTestResult.value = data;
+            } catch (e) { showToast(e.message, 'error'); } finally { routeTestLoading.value = false; }
+        };
+
+        // 图表
+        const curLabel = () => cfg.currency === 'USD' ? 'USD' : 'CNY';
+        const renderPie = () => { if (!pieChart.value) return; if (!pieInst) pieInst = echarts.init(pieChart.value); const data = (dashboard.value.model_distribution || []).map(d => ({ name: d.name || '未知', value: d.count })); pieInst.setOption({ tooltip: { trigger: 'item', formatter: '{b}: {c} ({d}%)' }, legend: { bottom: 0, type: 'scroll' }, series: [{ type: 'pie', radius: ['40%', '70%'], data: data.length ? data : [{ name: '暂无数据', value: 1 }], itemStyle: { borderRadius: 6, borderColor: '#fff', borderWidth: 2 }, label: { show: true, formatter: '{b}\n{d}%' } }], color: ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899', '#14b8a6'] }); };
+        const renderLine = () => { if (!lineChart.value) return; if (!lineInst) lineInst = echarts.init(lineChart.value); const trend = dashboard.value.daily_trend || []; lineInst.setOption({ tooltip: { trigger: 'axis' }, legend: { data: ['请求量', '成本(' + curLabel() + ')'] }, grid: { left: 50, right: 50, bottom: 30, top: 40 }, xAxis: { type: 'category', data: trend.map(t => t.day) }, yAxis: [{ type: 'value', name: '请求量', position: 'left' }, { type: 'value', name: '成本', position: 'right' }], series: [{ name: '请求量', type: 'line', smooth: true, data: trend.map(t => t.req), itemStyle: { color: '#3b82f6' } }, { name: '成本(' + curLabel() + ')', type: 'line', yAxisIndex: 1, smooth: true, data: trend.map(t => t.cost), itemStyle: { color: '#f59e0b' } }] }); };
+        const renderTaskPie = () => { if (!taskPieChart.value) return; if (!taskPieInst) taskPieInst = echarts.init(taskPieChart.value); const data = (dashboard.value.task_type_distribution || []).map(d => ({ name: d.task_type || 'chat', value: d.count })); taskPieInst.setOption({ tooltip: { trigger: 'item', formatter: '{b}: {c} ({d}%)' }, legend: { bottom: 0, type: 'scroll' }, series: [{ type: 'pie', radius: ['40%', '70%'], data: data.length ? data : [{ name: '暂无数据', value: 1 }], itemStyle: { borderRadius: 6, borderColor: '#fff', borderWidth: 2 }, label: { show: true, formatter: '{b}\n{d}%' } }], color: ['#8b5cf6', '#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#ec4899', '#14b8a6'] }); };
+        const renderStats = () => { if (!statsChart.value) return; if (!statsInst) statsInst = echarts.init(statsChart.value); const trend = dashboard.value.daily_trend || []; statsInst.setOption({ tooltip: { trigger: 'axis' }, legend: { data: ['请求量', '成本(' + curLabel() + ')'] }, grid: { left: 50, right: 50, bottom: 30, top: 40 }, xAxis: { type: 'category', data: trend.map(t => t.day) }, yAxis: [{ type: 'value', name: '请求量' }, { type: 'value', name: '成本', position: 'right' }], series: [{ name: '请求量', type: 'bar', data: trend.map(t => t.req), itemStyle: { color: '#3b82f6' } }, { name: '成本(' + curLabel() + ')', type: 'line', yAxisIndex: 1, smooth: true, data: trend.map(t => t.cost), itemStyle: { color: '#f59e0b' } }] }); };
+
+        watch(activeTab, async (tab) => {
+            await nextTick();
+            if (tab === 'dashboard') { renderPie(); renderLine(); renderTaskPie(); }
+            if (tab === 'stats') { renderStats(); }
+            if (tab === 'feedback') loadNegativeFeedback();
+            if (tab === 'predictor') { loadTaskTypeStats(); loadTrainingSamples(); }
+            if (tab === 'route-logs') loadRouteLogs();
+        });
+
+        onMounted(async () => {
+            if (authToken.value) { try { await api('/admin/api/predictor/status'); isLoggedIn.value = true; await loadAllData(); } catch (e) { isLoggedIn.value = false; authToken.value = ''; localStorage.removeItem('smartrouter_token'); } }
+            setInterval(() => { if (isLoggedIn.value) { loadDashboard(); loadPredictorStatus(); } }, 10000);
+            window.addEventListener('resize', () => { pieInst && pieInst.resize(); lineInst && lineInst.resize(); statsInst && statsInst.resize(); taskPieInst && taskPieInst.resize(); });
+        });
+
+        return {
+            tabs, activeTab, dashboard, dashboardPeriod, dashboardPeriods, models, allMetrics, negativeFeedback, cfg,
+            predictorStatus, taskTypeDetector, taskTypeStats, recentTaskTypes,
+            toast, syncingPrices, syncingExchangeRate, exchangeRateStatus,
+            modelAliases, allTaskTypes, currencySymbol, formatTokenCount, getCapabilityColor, getDifficultyColor,
+            getRouteSourceLabel, getRouteSourceStyle,
+            isLoggedIn, loginPassword, loginLoading, loginError, newPassword, confirmPassword,
+            pieChart, lineChart, statsChart, taskPieChart,
+            onParamsBChange, onCapabilityManualChange, toggleTaskType,
+            doLogin, doLogout, saveModels, saveConfig, testModel, addModel, removeModel,
+            syncPrices, reloadConfig, changePassword, changeSshKey, sshKeyInput,
+            syncExchangeRate, addAlias, removeAlias, updateAliasKey, saveAliases, saveRouteWeights, routeWeightsCfg,
+            // 训练集管理
+            trainingSamples, trainingTotal, trainingPage, trainingPageSize,
+            trainingFilterSource, trainingSources, loadTrainingSamples,
+            showAddSampleModal, showEditSampleModal, showBatchImportModal,
+            retraining, sampleForm, batchImportText, batchImportSource,
+            editSample, closeSampleModal, saveSampleForm, deleteSample,
+            doBatchImport, retrainFromSamples,
+            predictTestPrompt, predictTestLoading, predictTestResult, testPredictModel,
+            selectedSamples, toggleAllSamples, batchDeleteSamples, resetPredictor,
+            showModelConfigModal, modelConfigName, modelConfigText, cloneModel, showModelConfig, saveModelConfig,
+            // 路由日志
+            routeLogs, routeLogTotal, routeLogPage, routeLogPageSize,
+            routeLogFilterModel, routeLogFilterSource, routeLogStats,
+            loadRouteLogs, clearRouteLogs, resetStats,
+            // 路由测试
+            routeTestPrompt, routeTestModel, routeTestResult, routeTestLoading, testRoute,
+        };
+    },
+}).mount('#app');
+</script>
+</body>
+</html>

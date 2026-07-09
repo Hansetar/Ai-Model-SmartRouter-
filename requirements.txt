@@ -1,0 +1,22 @@
+# OpenClaw SmartRouter Python 依赖
+# 独立模式核心依赖
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+httpx==0.27.2
+pyyaml==6.0.2
+
+# 预测引擎
+numpy==1.26.4
+scikit-learn==1.5.2
+onnxruntime==1.19.2
+
+# 认证（JWT）
+python-jose[cryptography]>=3.3.0
+python-multipart>=0.0.6
+
+# 可选：ONNX 模型下载与转换（开发时使用）
+# transformers==4.44.2
+# torch==2.4.1
+# requests
+# onnx
+# onnxscript
