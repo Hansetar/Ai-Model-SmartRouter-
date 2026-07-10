@@ -397,73 +397,73 @@ class Database:
             return [dict(r) for r in cur.fetchall()]
 
     def get_dashboard_stats(self, since: Optional[float] = None) -> Dict[str, Any]:
-        since = since or (time.time() - 86400)
         with self._connect() as conn:
+            # 构建 WHERE 子句：since 为 None 时不限制时间范围
+            where = "WHERE timestamp>=?" if since is not None else ""
+            params = (since,) if since is not None else ()
+
             # 今日拦截次数
             total = conn.execute(
-                "SELECT COUNT(*) AS c FROM request_logs WHERE timestamp>=?", (since,)
+                f"SELECT COUNT(*) AS c FROM request_logs {where}", params
             ).fetchone()["c"]
-            # 累计节省费用（按对比默认模型粗略估算）
-            saved = conn.execute(
-                "SELECT COALESCE(SUM(cost),0) AS s FROM request_logs WHERE timestamp>=?",
-                (since,),
-            ).fetchone()["s"]
+            # 累计花费（按货币分组，避免不同货币直接相加）
+            saved_by_currency = conn.execute(
+                f"SELECT cost_currency, COALESCE(SUM(cost),0) AS s FROM request_logs {where} GROUP BY cost_currency",
+                params
+            ).fetchall()
             # 平均延迟
             avg_lat = conn.execute(
-                "SELECT COALESCE(AVG(latency_ms),0) AS a FROM request_logs WHERE timestamp>=?",
-                (since,),
+                f"SELECT COALESCE(AVG(latency_ms),0) AS a FROM request_logs {where}", params
             ).fetchone()["a"]
             # Token 统计
             token_stats = conn.execute(
-                "SELECT COALESCE(SUM(prompt_tokens),0) AS total_input, "
-                "COALESCE(SUM(completion_tokens),0) AS total_output "
-                "FROM request_logs WHERE timestamp>=?",
-                (since,),
+                f"SELECT COALESCE(SUM(prompt_tokens),0) AS total_input, "
+                f"COALESCE(SUM(completion_tokens),0) AS total_output "
+                f"FROM request_logs {where}", params
             ).fetchone()
             # 各模型调用占比
             model_dist = conn.execute(
-                "SELECT routed_model AS name, COUNT(*) AS count "
-                "FROM request_logs WHERE timestamp>=? GROUP BY routed_model",
-                (since,),
+                f"SELECT routed_model AS name, COUNT(*) AS count "
+                f"FROM request_logs {where} GROUP BY routed_model", params
             ).fetchall()
             # 每日请求量与成本趋势
             daily = conn.execute(
-                "SELECT date(timestamp,'unixepoch') AS day, "
-                "COUNT(*) AS req, COALESCE(SUM(cost),0) AS cost, "
-                "COALESCE(SUM(prompt_tokens),0) AS input_tokens, "
-                "COALESCE(SUM(completion_tokens),0) AS output_tokens "
-                "FROM request_logs WHERE timestamp>=? GROUP BY day ORDER BY day",
-                (since,),
+                f"SELECT date(timestamp,'unixepoch') AS day, "
+                f"COUNT(*) AS req, COALESCE(SUM(cost),0) AS cost, "
+                f"COALESCE(SUM(prompt_tokens),0) AS input_tokens, "
+                f"COALESCE(SUM(completion_tokens),0) AS output_tokens "
+                f"FROM request_logs {where} GROUP BY day ORDER BY day", params
             ).fetchall()
             # 反馈统计
+            fb_where = "WHERE timestamp>=?" if since is not None else ""
+            fb_params = (since,) if since is not None else ()
             fb = conn.execute(
-                "SELECT sentiment, COUNT(*) AS c FROM feedback_records WHERE timestamp>=? "
-                "GROUP BY sentiment",
-                (since,),
+                f"SELECT sentiment, COUNT(*) AS c FROM feedback_records {fb_where} "
+                f"GROUP BY sentiment", fb_params
             ).fetchall()
             # 任务类型分布
+            task_where = "WHERE task_type IS NOT NULL" if since is None else "WHERE timestamp>=? AND task_type IS NOT NULL"
+            task_params = (since,) if since is not None else ()
             task_dist = conn.execute(
-                "SELECT task_type, COUNT(*) AS count FROM request_logs "
-                "WHERE timestamp>=? AND task_type IS NOT NULL GROUP BY task_type",
-                (since,),
+                f"SELECT task_type, COUNT(*) AS count FROM request_logs "
+                f"{task_where} GROUP BY task_type", task_params
             ).fetchall()
             # 任务类型统计详情
             task_stats = conn.execute("SELECT * FROM task_type_stats").fetchall()
             # 各模型 token 和花费统计
             model_token_stats = conn.execute(
-                "SELECT routed_model AS model_name, "
-                "COUNT(*) AS total_calls, "
-                "COALESCE(SUM(prompt_tokens),0) AS total_input_tokens, "
-                "COALESCE(SUM(completion_tokens),0) AS total_output_tokens, "
-                "COALESCE(SUM(cost),0) AS total_cost, "
-                "cost_currency "
-                "FROM request_logs WHERE timestamp>=? "
-                "GROUP BY routed_model, cost_currency",
-                (since,),
+                f"SELECT routed_model AS model_name, "
+                f"COUNT(*) AS total_calls, "
+                f"COALESCE(SUM(prompt_tokens),0) AS total_input_tokens, "
+                f"COALESCE(SUM(completion_tokens),0) AS total_output_tokens, "
+                f"COALESCE(SUM(cost),0) AS total_cost, "
+                f"cost_currency "
+                f"FROM request_logs {where} "
+                f"GROUP BY routed_model, cost_currency", params
             ).fetchall()
         return {
             "total_interceptions": total,
-            "saved_cost": round(float(saved), 6),
+            "saved_cost_by_currency": [dict(r) for r in saved_by_currency],
             "avg_latency_ms": round(float(avg_lat), 2),
             "total_input_tokens": int(token_stats["total_input"] or 0),
             "total_output_tokens": int(token_stats["total_output"] or 0),

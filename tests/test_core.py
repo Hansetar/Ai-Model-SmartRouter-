@@ -256,5 +256,119 @@ class TestRouterTaskTypes:
         assert r._calc_task_match({"task_types": []}, "coding") == 1.0
 
 
+class TestTokensToDifficulty:
+    """难度量化映射测试（含平滑插值）。"""
+
+    def setup_method(self):
+        """每个测试前重置配置。"""
+        Config.reset()
+        Config.get_instance(str(ROOT / "config.yaml"))
+
+    def test_exact_match_first_range(self):
+        """Token 在第一个范围内，返回对应 difficulty。"""
+        cfg = Config.get_instance()
+        # 默认配置: min_tokens=0, max_tokens=50, difficulty=10
+        assert cfg.tokens_to_difficulty(0) == 10
+        assert cfg.tokens_to_difficulty(25) == 10
+        assert cfg.tokens_to_difficulty(49) == 10
+
+    def test_exact_match_second_range(self):
+        """Token 在第二个范围内，返回对应 difficulty。"""
+        cfg = Config.get_instance()
+        # 默认配置: min_tokens=50, max_tokens=300, difficulty=30
+        assert cfg.tokens_to_difficulty(50) == 30
+        assert cfg.tokens_to_difficulty(200) == 30
+        assert cfg.tokens_to_difficulty(299) == 30
+
+    def test_exact_match_last_range(self):
+        """Token 在最后一个范围内，返回对应 difficulty。"""
+        cfg = Config.get_instance()
+        # 默认配置: min_tokens=2000, max_tokens=999999, difficulty=95
+        assert cfg.tokens_to_difficulty(2000) == 95
+        assert cfg.tokens_to_difficulty(50000) == 95
+
+    def test_above_max_returns_last_difficulty(self):
+        """Token 超过最大 max_tokens，返回最后一个范围的 difficulty。"""
+        cfg = Config.get_instance()
+        assert cfg.tokens_to_difficulty(999999) == 95
+        assert cfg.tokens_to_difficulty(1000000) == 95
+
+    def test_gap_interpolation(self):
+        """Token 落在范围间隙时，返回线性插值结果。"""
+        cfg = Config.get_instance()
+        # 构造有间隙的配置: [0,100)->10, [200,300)->50
+        cfg.difficulty_ranges = [
+            {"min_tokens": 0, "max_tokens": 100, "difficulty": 10},
+            {"min_tokens": 200, "max_tokens": 300, "difficulty": 50},
+        ]
+        # Token=150 在间隙 (100, 200) 正中间
+        # 插值: 10 + 0.5 * (50 - 10) = 30
+        assert cfg.tokens_to_difficulty(150) == 30
+        # Token=100 在间隙起点
+        assert cfg.tokens_to_difficulty(100) == 10
+        # Token=199 在间隙终点附近
+        # 插值: 10 + (99/100) * 40 = 49.6 → 50
+        assert cfg.tokens_to_difficulty(199) == 50
+
+    def test_gap_interpolation_asymmetric(self):
+        """间隙插值：Token 不在间隙正中。"""
+        cfg = Config.get_instance()
+        cfg.difficulty_ranges = [
+            {"min_tokens": 0, "max_tokens": 100, "difficulty": 20},
+            {"min_tokens": 200, "max_tokens": 300, "difficulty": 60},
+        ]
+        # Token=130, ratio=(130-100)/(200-100)=0.3
+        # 插值: 20 + 0.3 * (60 - 20) = 32
+        assert cfg.tokens_to_difficulty(130) == 32
+
+    def test_below_min_returns_first_difficulty(self):
+        """Token 低于最小 min_tokens，返回第一个范围的 difficulty。"""
+        cfg = Config.get_instance()
+        cfg.difficulty_ranges = [
+            {"min_tokens": 10, "max_tokens": 100, "difficulty": 20},
+            {"min_tokens": 100, "max_tokens": 500, "difficulty": 50},
+        ]
+        assert cfg.tokens_to_difficulty(0) == 20
+        assert cfg.tokens_to_difficulty(5) == 20
+
+    def test_single_range(self):
+        """只有一个范围时，精确匹配或边界返回。"""
+        cfg = Config.get_instance()
+        cfg.difficulty_ranges = [
+            {"min_tokens": 0, "max_tokens": 1000, "difficulty": 40},
+        ]
+        assert cfg.tokens_to_difficulty(500) == 40
+        assert cfg.tokens_to_difficulty(0) == 40
+        # 超出唯一范围，返回该范围的 difficulty
+        assert cfg.tokens_to_difficulty(1000) == 40
+
+    def test_empty_ranges_returns_default(self):
+        """空范围列表返回默认值 50。"""
+        cfg = Config.get_instance()
+        cfg.difficulty_ranges = []
+        assert cfg.tokens_to_difficulty(100) == 50
+
+    def test_default_config_no_gaps(self):
+        """默认配置无间隙，所有 Token 值应精确匹配。"""
+        cfg = Config.get_instance()
+        # 默认配置范围: [0,50)->10, [50,300)->30, [300,800)->50, [800,2000)->75, [2000,999999)->95
+        assert cfg.tokens_to_difficulty(0) == 10
+        assert cfg.tokens_to_difficulty(50) == 30
+        assert cfg.tokens_to_difficulty(300) == 50
+        assert cfg.tokens_to_difficulty(800) == 75
+        assert cfg.tokens_to_difficulty(2000) == 95
+
+    def test_result_always_in_valid_range(self):
+        """插值结果始终在 1-100 范围内。"""
+        cfg = Config.get_instance()
+        cfg.difficulty_ranges = [
+            {"min_tokens": 0, "max_tokens": 100, "difficulty": 1},
+            {"min_tokens": 200, "max_tokens": 300, "difficulty": 100},
+        ]
+        # 间隙中间插值
+        result = cfg.tokens_to_difficulty(150)
+        assert 1 <= result <= 100
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

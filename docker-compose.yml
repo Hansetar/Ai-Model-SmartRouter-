@@ -17,8 +17,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: openclaw/smart-router:1.0.0
-    container_name: openclaw-smart-router
+    image: han/smart-router:1.0.0
+    container_name: ai-smart-router
     restart: unless-stopped
     ports:
       - "${SMARTROUTER_PORT:-8000}:8000"

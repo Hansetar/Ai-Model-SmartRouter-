@@ -74,7 +74,7 @@ cp .env.example .env
 docker compose up -d --build
 
 # 或者
-docker build -t openclaw/smart-router:1.0.0 .
+docker build -t han/smart-router:1.0.0 .
 docker compose up -d
 
 # 3. 查看日志
@@ -99,7 +99,7 @@ docker run -d \
   -v ./config.yaml:/app/config.yaml \
   -v ./models:/app/models:ro \
   --env-file .env \
-  openclaw/smart-router:1.0.0
+  han/smart-router:1.0.0
 ```
 
 
@@ -595,5 +595,3 @@ python scripts/download_minilm.py
 ## License
 
 
-# 已知bug
-1. 模型克隆按钮失效

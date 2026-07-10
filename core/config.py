@@ -21,31 +21,31 @@ class ConfigError(Exception):
 
 
 # ---------------------------------------------------------------------- #
-# 参数量(B) -> 能力等级 换算表
+# 参数量(B) -> 能力等级 换算表（1-100 量化精度）
 # ---------------------------------------------------------------------- #
 # 基于业界主流模型的参数量与能力对应关系：
-#   <1B: 1 (极小模型，仅简单对话)
-#   1-7B: 2 (小模型，日常对话/简单任务)
-#   7-14B: 3 (中小模型，通用任务)
-#   14-70B: 4 (中大模型，复杂推理/代码)
-#   >70B: 5 (超大模型，高难度任务)
+#   <1B:  10 (极小模型，仅简单对话)
+#   1-7B: 25 (小模型，日常对话/简单任务)
+#   7-14B: 50 (中小模型，通用任务)
+#   14-70B: 75 (中大模型，复杂推理/代码)
+#   >70B:  95 (超大模型，高难度任务)
 def params_b_to_capability(params_b: float) -> int:
-    """将模型参数量(B)换算为能力等级(1-5)。
+    """将模型参数量(B)换算为能力等级(1-100)。
 
     :param params_b: 模型参数量，单位十亿(B)
-    :return: 能力等级 1-5
+    :return: 能力等级 1-100
     """
     if params_b <= 0:
-        return 1
+        return 10
     if params_b < 1:
-        return 1
+        return 10
     if params_b < 7:
-        return 2
+        return 25
     if params_b < 14:
-        return 3
+        return 50
     if params_b < 70:
-        return 4
-    return 5
+        return 75
+    return 95
 
 
 # 所有支持的请求类型
@@ -185,7 +185,7 @@ class Config:
             # 否则从 params_b 自动换算
             if "capability" not in m or m.get("capability") is None:
                 params_b = m.get("params_b", 0)
-                item["capability"] = params_b_to_capability(params_b) if params_b else 3
+                item["capability"] = params_b_to_capability(params_b) if params_b else 50
             # 确保 task_types 存在
             if "task_types" not in item or item["task_types"] is None:
                 item["task_types"] = []
@@ -221,9 +221,9 @@ class Config:
         default_name = self._data.get("default_model")
         if default_name:
             return self.get_model(default_name)
-        # 兜底：取第一个 capability>=3 的模型
+        # 兜底：取第一个 capability>=50 的模型
         for m in self.get_models():
-            if m.get("capability", 0) >= 3:
+            if m.get("capability", 0) >= 50:
                 return m
         models = self.get_models()
         return models[0] if models else None
@@ -291,9 +291,9 @@ class Config:
             model = self.get_model(fb_name)
             if model:
                 return model
-        # 兜底：取第一个 capability>=3 的模型
+        # 兜底：取第一个 capability>=50 的模型
         for m in self.get_models():
-            if m.get("capability", 0) >= 3:
+            if m.get("capability", 0) >= 50:
                 return m
         models = self.get_models()
         return models[0] if models else None
@@ -344,6 +344,89 @@ class Config:
     @route_weights.setter
     def route_weights(self, value: Dict[str, Any]) -> None:
         self._data["route_weights"] = value
+
+
+    @property
+    def difficulty_ranges(self) -> Dict[str, Any]:
+        """Token 消耗范围到难度的映射配置。
+
+        配置格式：
+        difficulty_ranges:
+          - min_tokens: 0
+            max_tokens: 50
+            difficulty: 10
+          - min_tokens: 50
+            max_tokens: 300
+            difficulty: 30
+          ...
+        """
+        defaults = [
+            {"min_tokens": 0, "max_tokens": 50, "difficulty": 10},
+            {"min_tokens": 50, "max_tokens": 300, "difficulty": 30},
+            {"min_tokens": 300, "max_tokens": 800, "difficulty": 50},
+            {"min_tokens": 800, "max_tokens": 2000, "difficulty": 75},
+            {"min_tokens": 2000, "max_tokens": 999999, "difficulty": 95},
+        ]
+        return self._data.get("difficulty_ranges", defaults)
+
+    @difficulty_ranges.setter
+    def difficulty_ranges(self, value: Any) -> None:
+        self._data["difficulty_ranges"] = value
+
+    def tokens_to_difficulty(self, tokens: int) -> int:
+        """根据 Token 消耗量映射到难度等级（1-100）。
+
+        支持阶梯式精确匹配和范围间隙线性插值：
+        1. Token 值落在某个 [min_tokens, max_tokens) 区间内 → 直接返回对应 difficulty
+        2. Token 值落在两个相邻范围的间隙 → 线性插值计算平滑难度
+        3. Token 值低于最小范围 → 返回第一个范围的 difficulty
+        4. Token 值高于最大范围 → 返回最后一个范围的 difficulty
+
+        :param tokens: Token 消耗量
+        :return: 难度等级 1-100
+        """
+        ranges = self.difficulty_ranges
+        if not ranges:
+            return 50
+
+        # 1. 精确匹配
+        for r in ranges:
+            if r.get("min_tokens", 0) <= tokens < r.get("max_tokens", 999999):
+                return int(r.get("difficulty", 50))
+
+        # 2. 间隙插值：按 min_tokens 排序后查找间隙
+        sorted_ranges = sorted(ranges, key=lambda r: r.get("min_tokens", 0))
+
+        # 低于最小范围
+        if tokens < sorted_ranges[0].get("min_tokens", 0):
+            return int(sorted_ranges[0].get("difficulty", 50))
+
+        # 高于最大范围
+        if tokens >= sorted_ranges[-1].get("max_tokens", 999999):
+            return int(sorted_ranges[-1].get("difficulty", 50))
+
+        # 只有一个范围
+        if len(sorted_ranges) == 1:
+            return int(sorted_ranges[0].get("difficulty", 50))
+
+        # 查找间隙并插值
+        for i in range(len(sorted_ranges) - 1):
+            lower = sorted_ranges[i]
+            upper = sorted_ranges[i + 1]
+            lower_max = lower.get("max_tokens", 999999)
+            upper_min = upper.get("min_tokens", 0)
+            if lower_max <= tokens < upper_min:
+                # 线性插值
+                gap = upper_min - lower_max
+                if gap <= 0:
+                    return int(upper.get("difficulty", 50))
+                ratio = (tokens - lower_max) / gap
+                lower_diff = float(lower.get("difficulty", 50))
+                upper_diff = float(upper.get("difficulty", 50))
+                difficulty = lower_diff + ratio * (upper_diff - lower_diff)
+                return max(1, min(100, int(round(difficulty))))
+
+        return 50
 
 
 # 全局单例

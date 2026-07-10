@@ -6,7 +6,7 @@
 # =====================================================================
 
 # ---------- 阶段 1：依赖构建 ----------
-FROM library/python:3.11-slim AS builder
+FROM python:3.11-slim AS builder
 
 # 设置 pip 镜像加速（国内构建）
 ENV PIP_NO_CACHE_DIR=1 \
@@ -21,14 +21,14 @@ COPY requirements.txt .
 RUN pip install --prefix=/install -r requirements.txt
 
 # ---------- 阶段 2：运行时 ----------
-FROM library/python:3.11-slim AS runtime
+FROM python:3.11-slim AS runtime
 
 # 元数据
-LABEL maintainer="OpenClaw SmartRouter Team" \
-      org.opencontainers.image.title="OpenClaw SmartRouter" \
+LABEL maintainer="Ai SmartRouter Team" \
+      org.opencontainers.image.title="Ai SmartRouter" \
       org.opencontainers.image.description="双模式智能路由插件 - 独立 API 代理网关" \
       org.opencontainers.image.version="1.0.0" \
-      org.opencontainers.image.source="https://github.com/openclaw/smart-router"
+      org.opencontainers.image.source="https://github.com/Hansetar/Ai-Model-SmartRouter-.git"
 
 # 安装运行时必要系统依赖（libgomp1 用于 onnxruntime）
 RUN apt-get update && apt-get install -y --no-install-recommends \

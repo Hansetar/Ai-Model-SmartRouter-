@@ -15,6 +15,7 @@ adapters/standalone_app.py
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import os
 import time
@@ -972,6 +973,93 @@ def create_app(predictor_instance=None) -> FastAPI:
         return {"object": "list", "data": data}
 
     # ------------------------------------------------------------------ #
+    # 标准余额查询接口（兼容 OpenAI 格式）
+    # ------------------------------------------------------------------ #
+    @app.get("/v1/balance")
+    async def get_balance(_auth=Depends(check_api_key)):
+        """标准 Token 余额查询接口。
+
+        返回所有启用模型的余额信息，格式兼容 OpenAI 风格，
+        便于 OpenClaw 等客户端理解和使用。
+
+        响应格式：
+        {
+            "object": "balance_list",
+            "data": [
+                {
+                    "model": "model-name",
+                    "balance": 100.0,
+                    "currency": "CNY",
+                    "balance_source": "manual|api|local_estimate",
+                    "is_frozen": false
+                }
+            ]
+        }
+        """
+        models = config.get_models()
+        target_currency = config.currency
+        result = []
+        for m in models:
+            if not m.get("enabled", True):
+                continue
+            # 余额来源判断
+            if m.get("balance_manual") is not None:
+                balance = float(m["balance_manual"])
+                source = "manual"
+            elif m.get("balance_frozen"):
+                balance = pricing_manager._get_cached_balance(m)
+                source = "cached"
+            else:
+                balance = pricing_manager._get_balance(m)
+                source = "api"
+            # 余额货币转换
+            balance_currency = m.get("balance_currency", m.get("price_currency", "USD"))
+            if balance_currency != target_currency and balance is not None:
+                balance = exchange_rate_manager.convert(balance, balance_currency, target_currency)
+                balance_currency = target_currency
+            result.append({
+                "model": m["name"],
+                "balance": round(balance, 6) if balance is not None else None,
+                "currency": balance_currency,
+                "balance_source": source,
+                "is_frozen": m.get("balance_frozen", False),
+            })
+        return {
+            "object": "balance_list",
+            "data": result,
+        }
+
+    @app.get("/v1/balance/{model_name}")
+    async def get_model_balance(model_name: str, _auth=Depends(check_api_key)):
+        """查询单个模型的 Token 余额。"""
+        resolved = config.resolve_model_name(model_name)
+        m = config.get_model(resolved)
+        if not m or not m.get("enabled", True):
+            raise OpenAIError(404, f"The model `{model_name}` does not exist")
+        target_currency = config.currency
+        if m.get("balance_manual") is not None:
+            balance = float(m["balance_manual"])
+            source = "manual"
+        elif m.get("balance_frozen"):
+            balance = pricing_manager._get_cached_balance(m)
+            source = "cached"
+        else:
+            balance = pricing_manager._get_balance(m)
+            source = "api"
+        balance_currency = m.get("balance_currency", m.get("price_currency", "USD"))
+        if balance_currency != target_currency and balance is not None:
+            balance = exchange_rate_manager.convert(balance, balance_currency, target_currency)
+            balance_currency = target_currency
+        return {
+            "object": "balance",
+            "model": m["name"],
+            "balance": round(balance, 6) if balance is not None else None,
+            "currency": balance_currency,
+            "balance_source": source,
+            "is_frozen": m.get("balance_frozen", False),
+        }
+
+    # ------------------------------------------------------------------ #
     # 反馈接口
     # ------------------------------------------------------------------ #
     @app.post("/v1/feedback")
@@ -1059,7 +1147,23 @@ def create_app(predictor_instance=None) -> FastAPI:
             since = now - 365 * 86400
         else:
             since = None  # all
-        return db.get_dashboard_stats(since)
+        data = db.get_dashboard_stats(since)
+        # 汇率转换：将 saved_cost_by_currency 转为当前显示货币
+        target_currency = config.currency
+        total_saved = 0.0
+        for item in data.get("saved_cost_by_currency", []):
+            cur = item.get("cost_currency", "USD")
+            val = float(item.get("s", 0))
+            total_saved += float(exchange_rate_manager.convert(val, cur, target_currency))
+        data["saved_cost"] = round(total_saved, 6)
+        data["cost_currency"] = target_currency
+        # model_token_stats 中的 total_cost 也做汇率转换
+        for m in data.get("model_token_stats", []):
+            if m.get("total_cost") and m.get("cost_currency") and m["cost_currency"] != target_currency:
+                m["total_cost"] = round(float(exchange_rate_manager.convert(
+                    m["total_cost"], m["cost_currency"], target_currency)), 6)
+                m["cost_currency"] = target_currency
+        return data
 
     @app.get("/admin/api/models")
     async def api_models(_admin=Depends(require_admin)):
@@ -1122,24 +1226,27 @@ def create_app(predictor_instance=None) -> FastAPI:
             pass
         return {"status": "ok"}
 
-    @app.post("/admin/api/models/{model_name}/clone")
+    @app.post("/admin/api/models/{model_name:path}/clone")
     async def api_clone_model(model_name: str, request: Request, _admin=Depends(require_admin)):
         """克隆模型配置，生成一个新模型。"""
         body = await request.json()
         new_name = body.get("new_name", f"{model_name}-copy")
-        existing = config.get_model(model_name)
+        # 从原始 YAML 数据中查找模型（避免 enrich 后的冗余字段）
+        models_data = config.get("models", [])
+        existing = None
+        for m in models_data:
+            if m.get("name") == model_name:
+                existing = m
+                break
         if not existing:
             raise HTTPException(status_code=404, detail="模型不存在")
         # 检查新名称是否已存在
-        if config.get_model(new_name):
-            raise HTTPException(status_code=400, detail=f"模型 {new_name} 已存在")
-        # 克隆配置
-        new_model = dict(existing)
+        for m in models_data:
+            if m.get("name") == new_name:
+                raise HTTPException(status_code=400, detail=f"模型 {new_name} 已存在")
+        # 克隆配置（深拷贝原始数据，仅修改名称）
+        new_model = copy.deepcopy(existing)
         new_model["name"] = new_name
-        # 清理运行时字段
-        for k in ["balance", "price_input_display", "price_output_display", "price_currency_display"]:
-            new_model.pop(k, None)
-        models_data = config.get("models", [])
         models_data.append(new_model)
         config.set("models", models_data)
         try:
@@ -1148,7 +1255,7 @@ def create_app(predictor_instance=None) -> FastAPI:
             pass
         return {"status": "ok", "name": new_name}
 
-    @app.get("/admin/api/models/{model_name}/config")
+    @app.get("/admin/api/models/{model_name:path}/config")
     async def api_get_model_config(model_name: str, _admin=Depends(require_admin)):
         """获取单个模型的原始 YAML 配置。"""
         models = config.get("models", [])
@@ -1157,7 +1264,7 @@ def create_app(predictor_instance=None) -> FastAPI:
                 return {"model": m}
         raise HTTPException(status_code=404, detail="模型不存在")
 
-    @app.put("/admin/api/models/{model_name}/config")
+    @app.put("/admin/api/models/{model_name:path}/config")
     async def api_update_model_config(model_name: str, request: Request, _admin=Depends(require_admin)):
         """直接更新单个模型的 YAML 配置。"""
         body = await request.json()
@@ -1182,7 +1289,7 @@ def create_app(predictor_instance=None) -> FastAPI:
             pass
         return {"status": "ok"}
 
-    @app.post("/admin/api/models/{model_name}/test")
+    @app.post("/admin/api/models/{model_name:path}/test")
     async def api_test_model(model_name: str, _admin=Depends(require_admin)):
         balance = pricing_manager.refresh_balance(model_name)
         return {"model": model_name, "balance": balance}
@@ -1334,6 +1441,35 @@ def create_app(predictor_instance=None) -> FastAPI:
         return {"status": "ok"}
 
     # ------------------------------------------------------------------ #
+    # 难度范围配置 API
+    # ------------------------------------------------------------------ #
+    @app.get("/admin/api/difficulty-ranges")
+    async def api_get_difficulty_ranges(_admin=Depends(require_admin)):
+        """获取 Token 消耗范围到难度的映射配置。"""
+        return {"difficulty_ranges": config.difficulty_ranges}
+
+    @app.post("/admin/api/difficulty-ranges")
+    async def api_set_difficulty_ranges(request: Request, _admin=Depends(require_admin)):
+        """更新 Token 消耗范围到难度的映射配置。"""
+        body = await request.json()
+        ranges = body.get("difficulty_ranges")
+        if not ranges or not isinstance(ranges, list):
+            raise HTTPException(status_code=400, detail="difficulty_ranges 必须为非空数组")
+        for r in ranges:
+            if not isinstance(r, dict):
+                raise HTTPException(status_code=400, detail="每条范围必须为对象")
+            if "min_tokens" not in r or "max_tokens" not in r or "difficulty" not in r:
+                raise HTTPException(status_code=400, detail="每条范围必须包含 min_tokens, max_tokens, difficulty")
+            if not (1 <= int(r["difficulty"]) <= 100):
+                raise HTTPException(status_code=400, detail="difficulty 必须为 1-100")
+        config.difficulty_ranges = ranges
+        try:
+            config.save()
+        except Exception:
+            pass
+        return {"status": "ok", "difficulty_ranges": ranges}
+
+    # ------------------------------------------------------------------ #
     # 训练集管理 API
     # ------------------------------------------------------------------ #
     @app.get("/admin/api/training-samples")
@@ -1370,8 +1506,8 @@ def create_app(predictor_instance=None) -> FastAPI:
         source = body.get("source", "manual")
         if not prompt:
             raise HTTPException(status_code=400, detail="prompt 不能为空")
-        if difficulty is None or not (1 <= int(difficulty) <= 5):
-            raise HTTPException(status_code=400, detail="difficulty 必须为 1-5 的整数")
+        if difficulty is None or not (1 <= int(difficulty) <= 100):
+            raise HTTPException(status_code=400, detail="difficulty 必须为 1-100 的整数")
         sample_id = db.add_training_sample(
             prompt=prompt,
             difficulty=int(difficulty),
@@ -1489,8 +1625,8 @@ def create_app(predictor_instance=None) -> FastAPI:
             if not prompt or difficulty is None:
                 errors.append({"index": i, "error": "prompt 或 difficulty 缺失"})
                 continue
-            if not (1 <= int(difficulty) <= 5):
-                errors.append({"index": i, "error": "difficulty 必须为 1-5"})
+            if not (1 <= int(difficulty) <= 100):
+                errors.append({"index": i, "error": "difficulty 必须为 1-100"})
                 continue
             db.add_training_sample(
                 prompt=prompt,
@@ -1738,7 +1874,20 @@ def create_app(predictor_instance=None) -> FastAPI:
     # ------------------------------------------------------------------ #
     web_dist = Path(__file__).resolve().parent.parent / "web" / "dist"
     if web_dist.exists():
-        app.mount("/admin", StaticFiles(directory=str(web_dist), html=True), name="admin")
+        # 自定义 StaticFiles 子类，添加 no-cache 头防止浏览器缓存旧页面
+        class NoCacheStaticFiles(StaticFiles):
+            async def __call__(self, scope, receive, send):
+                async def send_with_no_cache(message):
+                    if message["type"] == "http.response.start":
+                        headers = dict(message.get("headers", []))
+                        headers[b"cache-control"] = b"no-cache, no-store, must-revalidate"
+                        headers[b"pragma"] = b"no-cache"
+                        headers[b"expires"] = b"0"
+                        message["headers"] = list(headers.items())
+                    await send(message)
+                await super().__call__(scope, receive, send_with_no_cache)
+
+        app.mount("/admin", NoCacheStaticFiles(directory=str(web_dist), html=True), name="admin")
 
     return app
 

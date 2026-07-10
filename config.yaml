@@ -1,4 +1,4 @@
-admin_password: admin
+admin_password: your-admin-password
 api_key: ""
 ssh_key: ""
 balance_cache_seconds: 300

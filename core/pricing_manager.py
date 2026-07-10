@@ -301,7 +301,11 @@ class PricingManager:
     # 本地扣账
     # ------------------------------------------------------------------ #
     def deduct(self, model_name: str, cost: float) -> None:
-        """调用结束后本地扣账。"""
+        """调用结束后本地扣账。
+
+        对于手动设定余额的模型，同步更新 balance_manual 值，
+        确保消耗的 token 费用从手动余额中扣除。
+        """
         from .database import db
 
         with self._lock:
@@ -310,6 +314,23 @@ class PricingManager:
                 new_balance = max(0.0, cached[1] - cost)
                 self._balance_cache[model_name] = (time.time(), new_balance)
                 db.update_balance(model_name, new_balance)
+
+        # 手动设定余额模式：同步更新 config 中的 balance_manual
+        models = config.get("models", [])
+        for m in models:
+            if m.get("name") == model_name and m.get("balance_manual") is not None:
+                old_balance = float(m["balance_manual"])
+                new_manual = max(0.0, old_balance - cost)
+                m["balance_manual"] = new_manual
+                config.set("models", models)
+                # 更新缓存以保持一致
+                with self._lock:
+                    self._balance_cache[model_name] = (time.time(), new_manual)
+                try:
+                    config.save()
+                except Exception:
+                    pass
+                break
 
     # ------------------------------------------------------------------ #
     # 价格同步（后台线程）

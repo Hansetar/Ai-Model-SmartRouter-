@@ -87,8 +87,8 @@
                     <button @click="resetStats" class="px-3 py-1.5 bg-red-500 text-white rounded text-sm hover:bg-red-600">清除累计数据</button>
                 </div>
                 <div class="grid grid-cols-1 md:grid-cols-6 gap-4 mb-6">
-                    <div class="stat-card"><div class="text-sm text-gray-500">今日转发次数</div><div class="text-3xl font-bold text-blue-600 mt-2">{{ dashboard.total_interceptions || 0 }}</div></div>
-                    <div class="stat-card"><div class="text-sm text-gray-500">累计花费 ({{ cfg.currency || 'CNY' }})</div><div class="text-3xl font-bold text-orange-600 mt-2">{{ currencySymbol }}{{ (dashboard.saved_cost || 0).toFixed(4) }}</div></div>
+                    <div class="stat-card"><div class="text-sm text-gray-500">{{ periodLabel }}转发次数</div><div class="text-3xl font-bold text-blue-600 mt-2">{{ dashboard.total_interceptions || 0 }}</div></div>
+                    <div class="stat-card"><div class="text-sm text-gray-500">{{ periodLabel }}花费 ({{ cfg.currency || 'CNY' }})</div><div class="text-3xl font-bold text-orange-600 mt-2">{{ currencySymbol }}{{ (dashboard.saved_cost || 0).toFixed(4) }}</div></div>
                     <div class="stat-card"><div class="text-sm text-gray-500">输入Token总量</div><div class="text-3xl font-bold text-indigo-600 mt-2">{{ formatTokenCount(dashboard.total_input_tokens || 0) }}</div></div>
                     <div class="stat-card"><div class="text-sm text-gray-500">输出Token总量</div><div class="text-3xl font-bold text-cyan-600 mt-2">{{ formatTokenCount(dashboard.total_output_tokens || 0) }}</div></div>
                     <div class="stat-card"><div class="text-sm text-gray-500">平均响应延迟</div><div class="text-3xl font-bold text-green-600 mt-2">{{ (dashboard.avg_latency_ms || 0).toFixed(0) }} ms</div></div>
@@ -234,6 +234,7 @@
                     <div class="flex justify-between items-center mb-4">
                         <h3 class="text-lg font-semibold">模型列表</h3>
                         <div class="flex space-x-2">
+                            <button @click="reloadModelsFromConfig" class="px-3 py-1.5 border border-orange-500 text-orange-500 rounded text-sm hover:bg-orange-50">重新加载</button>
                             <button @click="syncPrices" :disabled="syncingPrices" class="px-3 py-1.5 border border-green-500 text-green-500 rounded text-sm hover:bg-green-50 disabled:opacity-50">{{ syncingPrices ? '同步中...' : '同步价格' }}</button>
                             <button @click="saveModels" class="px-3 py-1.5 bg-blue-500 text-white rounded text-sm hover:bg-blue-600">保存配置</button>
                         </div>
@@ -263,7 +264,7 @@
                                         <div class="flex items-center space-x-1">
                                             <span class="text-xs font-medium" :class="getCapabilityColor(m.capability)">{{ m.capability || '-' }}</span>
                                             <label class="flex items-center"><input type="checkbox" v-model="m.capability_manual" @change="onCapabilityManualChange(m)" class="w-3 h-3"><span class="text-xs text-gray-400 ml-0.5">手动</span></label>
-                                            <input v-if="m.capability_manual" type="number" v-model.number="m.capability" min="1" max="5" class="border rounded px-1 py-0.5 w-10 text-xs">
+                                            <input v-if="m.capability_manual" type="number" v-model.number="m.capability" min="1" max="100" class="border rounded px-1 py-0.5 w-12 text-xs">
                                         </div>
                                     </td>
                                     <td class="px-2 py-2" style="min-width: 140px;">
@@ -562,6 +563,30 @@
                 </div>
 
                 <div class="bg-white rounded-lg shadow p-5 mb-6">
+                    <h3 class="text-lg font-semibold mb-4">难度量化配置（1-100）</h3>
+                    <p class="text-sm text-gray-500 mb-3">设定 Token 消耗量范围对应的难度等级。难度越高，路由器会优先选择能力更强的模型。</p>
+                    <div class="space-y-2 mb-3">
+                        <div class="grid grid-cols-8 gap-2 text-xs text-gray-500 font-medium px-1">
+                            <div class="col-span-3">最小 Token</div>
+                            <div class="col-span-3">最大 Token</div>
+                            <div class="col-span-1">难度</div>
+                            <div class="col-span-1"></div>
+                        </div>
+                        <div v-for="(r, i) in difficultyRanges" :key="i" class="grid grid-cols-8 gap-2 items-center">
+                            <div class="col-span-3"><input type="number" v-model.number="r.min_tokens" min="0" class="border rounded px-2 py-1.5 w-full text-sm"></div>
+                            <div class="col-span-3"><input type="number" v-model.number="r.max_tokens" min="0" class="border rounded px-2 py-1.5 w-full text-sm"></div>
+                            <div class="col-span-1"><input type="number" v-model.number="r.difficulty" min="1" max="100" class="border rounded px-2 py-1.5 w-full text-sm"></div>
+                            <div class="col-span-1"><button @click="difficultyRanges.splice(i, 1)" class="text-red-500 hover:underline text-xs">删除</button></div>
+                        </div>
+                        <div v-if="difficultyRanges.length === 0" class="text-sm text-gray-400">暂无配置，点击下方添加</div>
+                    </div>
+                    <div class="flex space-x-3">
+                        <button @click="difficultyRanges.push({min_tokens: 0, max_tokens: 100, difficulty: 50})" class="px-3 py-1.5 border-2 border-dashed border-gray-300 rounded text-gray-500 hover:border-blue-400 hover:text-blue-500 text-sm">+ 添加范围</button>
+                        <button @click="saveDifficultyRanges" class="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 text-sm">保存难度配置</button>
+                    </div>
+                </div>
+
+                <div class="bg-white rounded-lg shadow p-5 mb-6">
                     <h3 class="text-lg font-semibold mb-4">模型名映射（别名）</h3>
                     <p class="text-sm text-gray-500 mb-3">将请求中的模型名映射为实际模型名，使 OpenClaw 等客户端可以用 gpt-4 等名称连接。</p>
                     <div class="space-y-2 mb-3">
@@ -630,10 +655,11 @@
                 </div>
                 <div class="grid grid-cols-3 gap-4">
                     <div>
-                        <label class="block text-sm text-gray-600 mb-1">难度 (1-5) *</label>
-                        <input type="number" v-model.number="sampleForm.difficulty" min="1" max="5" class="w-full border rounded px-3 py-2 text-sm">
+                        <label class="block text-sm text-gray-600 mb-1">难度 (1-100) *</label>
+                        <input type="number" v-model.number="sampleForm.difficulty" min="1" max="100" class="w-full border rounded px-3 py-2 text-sm">
                         <div class="flex space-x-1 mt-1">
-                            <span v-for="d in 5" :key="d" @click="sampleForm.difficulty = d" :class="['w-6 h-6 rounded text-xs flex items-center justify-center cursor-pointer', d <= sampleForm.difficulty ? 'bg-blue-500 text-white' : 'bg-gray-200 text-gray-500']">{{ d }}</span>
+                            <input type="number" v-model.number="sampleForm.difficulty" min="1" max="100" class="border rounded px-2 py-1 w-16 text-sm">
+                            <span class="text-xs text-gray-400 self-center">/ 100</span>
                         </div>
                     </div>
                     <div>
@@ -745,6 +771,7 @@ createApp({
         const syncingExchangeRate = ref(false);
         const exchangeRateStatus = ref({});
         const modelAliases = reactive({});
+        const difficultyRanges = reactive([]);
         const allTaskTypes = ['coding', 'math', 'reasoning', 'creative', 'chat', 'translation', 'analysis'];
 
         const isLoggedIn = ref(false);
@@ -763,8 +790,10 @@ createApp({
         let pieInst = null, lineInst = null, statsInst = null, taskPieInst = null;
 
         const currencySymbol = computed(() => cfg.currency === 'USD' ? '$' : '¥');
-
-        // 训练集管理状态
+        const periodLabel = computed(() => {
+            const map = { today: '今日', week: '本周', month: '本月', year: '今年', all: '累计' };
+            return map[dashboardPeriod.value] || '今日';
+        });
         const trainingSamples = ref([]);
         const trainingTotal = ref(0);
         const trainingPage = ref(1);
@@ -777,7 +806,7 @@ createApp({
         const retraining = ref(false);
         const batchImportText = ref('');
         const batchImportSource = ref('batch_import');
-        const sampleForm = reactive({ id: null, prompt: '', difficulty: 3, est_tokens: 500, task_type: '', model_name: '', source: 'manual' });
+        const sampleForm = reactive({ id: null, prompt: '', difficulty: 50, est_tokens: 500, task_type: '', model_name: '', source: 'manual' });
         const predictTestPrompt = ref('');
         const predictTestLoading = ref(false);
         const predictTestResult = ref(null);
@@ -816,9 +845,9 @@ createApp({
             return String(count);
         };
 
-        const paramsBToCapability = (paramsB) => { if (!paramsB || paramsB <= 0) return 1; if (paramsB < 1) return 1; if (paramsB < 7) return 2; if (paramsB < 14) return 3; if (paramsB < 70) return 4; return 5; };
-        const getCapabilityColor = (cap) => { if (cap >= 5) return 'text-red-600 font-bold'; if (cap >= 4) return 'text-orange-600'; if (cap >= 3) return 'text-blue-600'; if (cap >= 2) return 'text-green-600'; return 'text-gray-500'; };
-        const getDifficultyColor = (d) => { if (d >= 5) return 'text-red-600 font-bold'; if (d >= 4) return 'text-orange-600'; if (d >= 3) return 'text-blue-600'; if (d >= 2) return 'text-green-600'; return 'text-gray-500'; };
+        const paramsBToCapability = (paramsB) => { if (!paramsB || paramsB <= 0) return 10; if (paramsB < 1) return 10; if (paramsB < 7) return 25; if (paramsB < 14) return 50; if (paramsB < 70) return 75; return 95; };
+        const getCapabilityColor = (cap) => { if (cap >= 80) return 'text-red-600 font-bold'; if (cap >= 60) return 'text-orange-600'; if (cap >= 40) return 'text-blue-600'; if (cap >= 20) return 'text-green-600'; return 'text-gray-500'; };
+        const getDifficultyColor = (d) => { if (d >= 80) return 'text-red-600 font-bold'; if (d >= 60) return 'text-orange-600'; if (d >= 40) return 'text-blue-600'; if (d >= 20) return 'text-green-600'; return 'text-gray-500'; };
         const getRouteSourceLabel = (s) => { if (s === 'auto') return '智能路由'; if (s === 'direct') return '直连'; if (s === 'cache') return '缓存'; if (s === 'fallback') return '降级'; if (s === 'keyword') return '关键词'; return s || '未知'; };
         const getRouteSourceStyle = (s) => { if (s === 'auto') return 'tag tag-active'; if (s === 'direct') return 'tag'; if (s === 'cache') return 'tag'; if (s === 'fallback') return 'tag'; if (s === 'keyword') return 'tag tag-active'; return 'tag'; };
         const onParamsBChange = (m) => { if (!m.capability_manual) m.capability = paramsBToCapability(m.params_b); };
@@ -869,6 +898,8 @@ createApp({
                     if (data.route_weights.model_preferences) Object.assign(routeWeightsCfg.model_preferences, data.route_weights.model_preferences);
                 }
                 loadExchangeRateStatus();
+                // 加载难度范围配置
+                loadDifficultyRanges();
                 // 加载 SSH Key（脱敏值不回填到输入框）
                 if (data.ssh_key && data.ssh_key !== '***') { sshKeyInput.value = data.ssh_key; }
                 else { sshKeyInput.value = ''; }
@@ -883,6 +914,7 @@ createApp({
         const addModel = () => { models.value.push({ name: 'new-model', base_url: '', api_key: '', api_type: 'openai', params_b: 7, capability: 3, capability_manual: false, task_types: ['chat'], price_input: 0, price_output: 0, price_currency: 'CNY', price_unit: '1M', price_frozen: false, balance_manual: null, balance_currency: 'CNY', balance_frozen: false, enabled: true, litellm_name: '' }); };
         const removeModel = (i) => { models.value.splice(i, 1); };
         const syncPrices = async () => { syncingPrices.value = true; try { const data = await api('/admin/api/sync-prices', { method: 'POST' }); showToast(`价格同步完成，更新了 ${data.updated_models} 个模型`); loadModels(); loadConfig(); } catch (e) { showToast(e.message, 'error'); } finally { syncingPrices.value = false; } };
+        const reloadModelsFromConfig = async () => { if (!confirm('确定从配置文件重新加载模型？未保存的修改将丢失。')) return; try { await api('/admin/api/reload-config', { method: 'POST' }); await loadModels(); showToast('已从配置文件重新加载模型'); } catch (e) { showToast(e.message, 'error'); } };
         const reloadConfig = async () => { try { await api('/admin/api/reload-config', { method: 'POST' }); showToast('配置已重新加载'); await loadAllData(); } catch (e) { showToast(e.message, 'error'); } };
         const changePassword = async () => {
             if (!newPassword.value || newPassword.value.length < 4) { showToast('密码长度至少4位', 'error'); return; }
@@ -900,6 +932,9 @@ createApp({
         const removeAlias = (key) => { delete modelAliases[key]; };
         const updateAliasKey = (event, oldKey) => { const newKey = event.target.value.trim(); if (newKey && newKey !== oldKey) { modelAliases[newKey] = modelAliases[oldKey]; delete modelAliases[oldKey]; } };
         const saveAliases = async () => { try { await api('/admin/api/config', { method: 'POST', body: JSON.stringify({ model_aliases: { ...modelAliases } }) }); showToast('模型别名已保存'); } catch (e) { showToast(e.message, 'error'); } };
+
+        const loadDifficultyRanges = async () => { try { const d = await api('/admin/api/difficulty-ranges'); difficultyRanges.splice(0, difficultyRanges.length, ...(d.difficulty_ranges || [])); } catch (e) { console.error('loadDifficultyRanges', e); } };
+        const saveDifficultyRanges = async () => { try { await api('/admin/api/difficulty-ranges', { method: 'POST', body: JSON.stringify({ difficulty_ranges: [...difficultyRanges] }) }); showToast('难度配置已保存'); } catch (e) { showToast(e.message, 'error'); } };
 
         const saveRouteWeights = async () => {
             try {
@@ -940,13 +975,13 @@ createApp({
 
         const closeSampleModal = () => {
             showAddSampleModal.value = false; showEditSampleModal.value = false;
-            sampleForm.id = null; sampleForm.prompt = ''; sampleForm.difficulty = 3;
+            sampleForm.id = null; sampleForm.prompt = ''; sampleForm.difficulty = 50;
             sampleForm.est_tokens = 500; sampleForm.task_type = ''; sampleForm.model_name = ''; sampleForm.source = 'manual';
         };
 
         const saveSampleForm = async () => {
             if (!sampleForm.prompt) { showToast('Prompt 不能为空', 'error'); return; }
-            if (!sampleForm.difficulty || sampleForm.difficulty < 1 || sampleForm.difficulty > 5) { showToast('难度必须为 1-5', 'error'); return; }
+            if (!sampleForm.difficulty || sampleForm.difficulty < 1 || sampleForm.difficulty > 100) { showToast('难度必须为 1-100', 'error'); return; }
             try {
                 if (showEditSampleModal.value && sampleForm.id) {
                     await api(`/admin/api/training-samples/${sampleForm.id}`, {
@@ -1115,14 +1150,14 @@ createApp({
             tabs, activeTab, dashboard, dashboardPeriod, dashboardPeriods, models, allMetrics, negativeFeedback, cfg,
             predictorStatus, taskTypeDetector, taskTypeStats, recentTaskTypes,
             toast, syncingPrices, syncingExchangeRate, exchangeRateStatus,
-            modelAliases, allTaskTypes, currencySymbol, formatTokenCount, getCapabilityColor, getDifficultyColor,
+            modelAliases, difficultyRanges, allTaskTypes, currencySymbol, periodLabel, formatTokenCount, getCapabilityColor, getDifficultyColor,
             getRouteSourceLabel, getRouteSourceStyle,
             isLoggedIn, loginPassword, loginLoading, loginError, newPassword, confirmPassword,
             pieChart, lineChart, statsChart, taskPieChart,
             onParamsBChange, onCapabilityManualChange, toggleTaskType,
             doLogin, doLogout, saveModels, saveConfig, testModel, addModel, removeModel,
-            syncPrices, reloadConfig, changePassword, changeSshKey, sshKeyInput,
-            syncExchangeRate, addAlias, removeAlias, updateAliasKey, saveAliases, saveRouteWeights, routeWeightsCfg,
+            syncPrices, reloadModelsFromConfig, reloadConfig, changePassword, changeSshKey, sshKeyInput,
+            syncExchangeRate, addAlias, removeAlias, updateAliasKey, saveAliases, saveDifficultyRanges, saveRouteWeights, routeWeightsCfg,
             // 训练集管理
             trainingSamples, trainingTotal, trainingPage, trainingPageSize,
             trainingFilterSource, trainingSources, loadTrainingSamples,
@@ -1136,7 +1171,7 @@ createApp({
             // 路由日志
             routeLogs, routeLogTotal, routeLogPage, routeLogPageSize,
             routeLogFilterModel, routeLogFilterSource, routeLogStats,
-            loadRouteLogs, clearRouteLogs, resetStats,
+            loadRouteLogs, clearRouteLogs, resetStats, loadDashboard,
             // 路由测试
             routeTestPrompt, routeTestModel, routeTestResult, routeTestLoading, testRoute,
         };

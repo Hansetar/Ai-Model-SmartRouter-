@@ -94,7 +94,7 @@ class FeedbackAnalyzer:
             and prompt
             and predicted_difficulty is not None
         ):
-            corrected_diff = min(5, predicted_difficulty + 1)
+            corrected_diff = min(100, predicted_difficulty + 10)
             # 真实 Token 数未知，用预测值兜底
             _, est_tokens = predictor.predict(prompt)
             predictor.add_sample(prompt, corrected_diff, est_tokens)
@@ -141,26 +141,24 @@ class FeedbackAnalyzer:
     # ------------------------------------------------------------------ #
     @staticmethod
     def estimate_difficulty(response: dict, cost: float = 0.0, completion_tokens: int = 0) -> int:
-        """根据响应、实际 token 消耗和费用综合评估真实难度。
+        """根据响应、实际 token 消耗和费用综合评估真实难度（1-100）。
 
         核心逻辑：消耗大量 token / 花费高 = 高难度任务；消耗很少 = 低难度。
-        - 费用 > 0.01 元 或 completion_tokens > 2000 -> 难度 5
-        - 费用 > 0.001 元 或 completion_tokens > 800 -> 难度 4
-        - 费用 > 0.0001 元 或 completion_tokens > 300 -> 难度 3
-        - 费用 > 0 或 completion_tokens > 50 -> 难度 2
-        - 其他 -> 难度 1
+        优先使用配置中的 difficulty_ranges 映射，回退到连续映射。
         """
+        from .config import config
+
         # 优先使用 token 消耗和费用判断
         if completion_tokens > 0 or cost > 0:
-            if cost > 0.01 or completion_tokens > 2000:
-                return 5
-            if cost > 0.001 or completion_tokens > 800:
-                return 4
-            if cost > 0.0001 or completion_tokens > 300:
-                return 3
-            if cost > 0 or completion_tokens > 50:
-                return 2
-            return 1
+            # 使用配置中的 Token 消耗范围映射
+            token_diff = config.tokens_to_difficulty(completion_tokens)
+            # 基于 cost 的难度映射
+            if cost > 0:
+                cost_diff = min(100, max(1, int(cost * 10000)))
+            else:
+                cost_diff = 1
+            # 取两者较大值
+            return max(token_diff, cost_diff)
 
         # 降级：根据响应内容长度启发式评估
         content = ""
@@ -169,18 +167,15 @@ class FeedbackAnalyzer:
             if choices:
                 content = choices[0].get("message", {}).get("content", "")
         if not content:
-            return 3
+            return 50
         length = len(content)
         has_code = "```" in content
-        if length > 2000 or (has_code and length > 800):
-            return 5
-        if length > 800 or has_code:
-            return 4
-        if length > 300:
-            return 3
-        if length > 100:
-            return 2
-        return 1
+        # 使用内容长度估算 token 数（约 4 字符 = 1 token），再映射到难度
+        est_tokens = max(1, length // 4)
+        base_diff = config.tokens_to_difficulty(est_tokens)
+        if has_code:
+            base_diff = min(100, base_diff + 20)
+        return base_diff
 
 
 # 全局单例

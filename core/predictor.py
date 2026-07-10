@@ -38,8 +38,8 @@ except Exception:  # noqa: BLE001
     _HAS_SKLEARN = False
 
 
-# 难度等级 1-5
-_DIFF_CLASSES = np.array([1, 2, 3, 4, 5])
+# 难度等级 1-100（量化精度）
+_DIFF_CLASSES = np.array(list(range(1, 101)))
 
 
 class OnlinePredictor:
@@ -152,7 +152,7 @@ class OnlinePredictor:
     # 同步预测（要求 <30ms）
     # ------------------------------------------------------------------ #
     def predict(self, prompt: str) -> Tuple[int, int]:
-        """同步预测难度(1-5)与预估输出 Token 数。"""
+        """同步预测难度(1-100)与预估输出 Token 数。"""
         t0 = time.perf_counter()
 
         # 缓存命中
@@ -163,7 +163,7 @@ class OnlinePredictor:
 
         # 冷启动降级
         if not self._is_initialized or self._clf is None or self._reg is None:
-            return 3, 500
+            return 50, 500
 
         try:
             embedding = self._get_embedding(prompt)
@@ -172,7 +172,7 @@ class OnlinePredictor:
                 est_tokens = max(1, int(self._reg.predict(embedding)[0]))
         except Exception as exc:  # noqa: BLE001
             print(f"[Predictor] predict failed: {exc}", file=sys.stderr)
-            return 3, 500
+            return 50, 500
 
         # 写缓存
         self._cache[cache_key] = (time.time(), (difficulty, est_tokens))

@@ -385,7 +385,7 @@ class SmartRouter:
 
         最终排序 = predictor_weight * 预测推荐分 + score_weight * 评分分 + 用户偏好加成
 
-        :param difficulty: 预测难度 1-5
+        :param difficulty: 预测难度 1-100
         :param est_in_tokens: 预估输入 Token
         :param est_out_tokens: 预估输出 Token
         :param exclude: 排除的模型名列表（重试场景）
@@ -629,7 +629,7 @@ class SmartRouter:
         返回排除已失败模型后，按价格从低到高排序的所有可用模型列表。
         调用方可依次尝试，直到成功为止。
 
-        :param difficulty: 预测难度 1-5
+        :param difficulty: 预测难度 1-100
         :param est_in_tokens: 预估输入 Token
         :param est_out_tokens: 预估输出 Token
         :param failed_models: 已失败的模型名列表
@@ -676,7 +676,7 @@ class SmartRouter:
 
             # 能力差距惩罚：能力低于难度的模型排在后面
             capability = model.get("capability", 0)
-            capability_penalty = max(0, difficulty - capability) * 1000 if capability < difficulty else 0
+            capability_penalty = max(0, difficulty - capability) * 10 if capability < difficulty else 0
 
             candidates.append({
                 "model": model,
