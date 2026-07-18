@@ -1,4 +1,4 @@
-# OpenClaw SmartRouter 双模式智能路由插件
+# OpenClaw SmartRouter 双模式智能路由插件(半成品)
 
 > 为大模型调用提供成本最优化与质量自适应的中间层调度。
 > "内核 + 双形态外壳" 解耦设计，既可作为 OpenClaw 内嵌插件（只对docker进行了测试，内嵌模式未测试），也可作为独立 API 代理网关运行。
