@@ -1,7 +1,7 @@
 # OpenClaw SmartRouter 双模式智能路由插件
 
 > 为大模型调用提供成本最优化与质量自适应的中间层调度。
-> "内核 + 双形态外壳" 解耦设计，既可作为 OpenClaw 内嵌插件（没有测试），也可作为独立 API 代理网关运行。
+> "内核 + 双形态外壳" 解耦设计，既可作为 OpenClaw 内嵌插件，也可作为独立 API 代理网关运行。
 
 ## 核心特性
 
@@ -12,6 +12,7 @@
 | 智能路由模式 | `model="auto"` 自动选择最优模型，指定模型名则直连代理 |
 | 预测期望模型 | 预测引擎直接返回期望调用的模型名、难度、任务类型 |
 | 动态成本最优路由 | 综合难度、Token、价格、余额、可靠性，免费模型优先 |
+| 模型生效时间 | 每个模型可配置生效时间段（如 09:00-18:00），时间外自动禁用，默认全天生效 |
 | 多维余量适配 | 策略模式适配 DeepSeek / 智谱 / SiliconFlow / OpenAI / 阿里云 / 本地估算 |
 | 自动价格同步 | 从 litellm model_prices.json 定时拉取最新模型单价，支持手动触发 |
 | 训练集可视管理 | Web 面板增删改查训练样本，批量导入，一键重训，新增标记自动消失 |
@@ -74,7 +75,7 @@ cp .env.example .env
 docker compose up -d --build
 
 # 或者
-docker build -t han/smart-router:1.0.0 .
+docker build -t han/smart-router:2.0.0 .
 docker compose up -d
 
 # 3. 查看日志
@@ -94,9 +95,10 @@ curl http://localhost:8000/health
 docker run -d \
   --restart=unless-stopped \
   --name ai-smart-router \
+  -e TZ=Asia/Shanghai\
   -p 8000:8000 \
   -v smart-router-data:/app/data \
-  -v ./config.yaml:/app/config.yaml \
+  -v ./config.yaml:/app/config.yaml:ro \
   -v ./models:/app/models:ro \
   --env-file .env \
   han/smart-router:1.0.0
@@ -265,6 +267,7 @@ models:
     price_input: 0.00014                # USD / 1M tokens
     price_output: 0.00028
     price_currency: "USD"
+    active_hours: "09:00-23:00"         # 生效时间段（格式: HH:MM-HH:MM），支持列表和跨天，留空或不设则全天生效
 
   - name: "glm-4-flash"
     api_type: "zhipu"
@@ -297,6 +300,47 @@ models:
 | `local` | 本地扣账估算 | 无（需手动配置 base_url） |
 
 > 所有 api_type 均使用 OpenAI 兼容接口格式代理请求。可自定义注册余额检查器。
+
+### 模型生效时间（active_hours）
+
+每个模型可配置生效时间段，在生效时间之外该模型会被自动禁用（不参与智能路由），默认全天生效。支持多个时间段和跨天时间段。
+
+**配置格式：** `HH:MM-HH:MM`，支持字符串或列表
+
+```yaml
+models:
+  - name: "deepseek-chat"
+    active_hours: "09:00-18:00"    # 仅在 9:00-18:00 生效
+    # ...
+
+  - name: "glm-4-flash"
+    active_hours: "21:00-09:00"    # 跨天：晚21点到次日上午9点
+    # ...
+
+  - name: "qwen2.5-7b-instruct"
+    active_hours:                   # 多个时间段，任一匹配即生效
+      - "09:00-12:00"              # 上午 9:00-12:00
+      - "14:00-18:00"              # 下午 14:00-18:00
+    # ...
+
+  - name: "claude-3-haiku"
+    # 不设 active_hours 或设为空，表示全天生效
+    # ...
+```
+
+**行为说明：**
+
+| 场景 | 行为 |
+|------|------|
+| `active_hours` 未设置或为空 | 全天生效（默认） |
+| 单个字符串 `"09:00-18:00"` | 仅在该时间段内生效 |
+| 列表 `["09:00-12:00", "14:00-18:00"]` | 多个时间段，任一匹配即生效 |
+| 跨天时间段 `"21:00-09:00"` | 晚21点到次日上午9点生效 |
+| 当前时间在任一生效时间段内 | 模型正常参与路由 |
+| 当前时间不在任何生效时间段内 | 模型被排除，不参与智能路由选择 |
+| 格式解析失败 | 降级为全天生效 |
+
+**Web 面板操作：** 模型管理页面中，生效时间列支持动态添加/删除多个时间段，显示绿色圆点（生效中/全天）或灰色圆点（未生效），移动端卡片视图显示"全天"/"生效中"/"未生效"文字状态。
 
 ### 环境变量
 
@@ -404,8 +448,11 @@ curl -X POST http://localhost:8000/v1/feedback \
 | `/admin/api/login` | POST | 管理面板登录，返回 JWT Token | 无 |
 | `/admin/api/change-password` | POST | 修改管理密码 | JWT |
 | `/admin/api/dashboard` | GET | 仪表盘统计 | JWT |
-| `/admin/api/models` | GET | 模型列表（含余额） | JWT |
+| `/admin/api/models` | GET | 模型列表（含余额、生效状态） | JWT |
 | `/admin/api/models` | POST | 保存模型配置 | JWT |
+| `/admin/api/models/{name}/clone` | POST | 克隆模型 | JWT |
+| `/admin/api/models/{name}/config` | GET | 获取单个模型原始配置 | JWT |
+| `/admin/api/models/{name}/config` | PUT | 更新单个模型配置 | JWT |
 | `/admin/api/models/{name}/test` | POST | 测试模型（刷新余额） | JWT |
 | `/admin/api/metrics` | GET | 模型聚合指标 | JWT |
 | `/admin/api/feedback/negative` | GET | 负向反馈列表 | JWT |
@@ -450,7 +497,7 @@ curl -H "Authorization: Bearer $TOKEN" http://localhost:8000/admin/api/dashboard
 |-----|------|
 | **仪表盘** | 今日转发次数、累计花费、平均延迟、反馈统计；模型调用占比饼图、每日趋势折线图、任务类型分布 |
 | **预测引擎** | 引擎状态/特征提取方式/已训练样本/缓存统计；任务类型检测器权重可视化；**训练集管理**（增删改查、批量导入、一键重训、来源过滤、分页、NEW 标记） |
-| **模型管理** | 模型列表 CRUD（名称/API类型/Base URL/参数量/能力/适合任务/价格/API Key/余额）；同步价格 |
+| **模型管理** | 模型列表 CRUD（名称/API类型/Base URL/参数量/能力/适合任务/价格/生效时间/API Key/余额）；同步价格；移动端卡片式布局 |
 | **调用统计** | 调用统计详情图表；模型聚合指标表（总调用/成功率/满意度/反馈/余额） |
 | **反馈中心** | 不认可对话详情（人工复盘） |
 | **路由日志** | 路由日志列表（时间/路由来源/请求模型/路由模型/Prompt预览/难度/类型/花费/延迟/状态）；按模型/来源过滤；统计卡片；清除日志 |
@@ -464,6 +511,21 @@ curl -H "Authorization: Bearer $TOKEN" http://localhost:8000/admin/api/dashboard
 - **编辑/删除**：直接在列表中操作
 - **重新训练**：一键从训练集重新训练预测模型
 - **NEW 标记**：新增样本显示绿色 NEW 标记，超时后自动消失（时长可在系统配置中调整）
+
+### 移动端适配
+
+Web 控制面板全面支持响应式布局和移动端访问：
+
+| 设备 | 适配策略 |
+|------|----------|
+| 桌面端（≥1024px） | 表格视图，多列网格布局 |
+| 平板端（768-1023px） | 表格视图，自适应列宽 |
+| 手机端（<1024px） | 模型管理使用卡片式布局替代表格；统计卡片2列排列；按钮组自动换行 |
+
+- 仪表盘统计卡片：手机端2列、平板3列、桌面6列
+- 图表区域：移动端单列堆叠，桌面端3列并排
+- 系统配置表单：移动端单列，桌面端双列
+- 导航栏：支持横向滚动，小屏幕缩小字体
 
 ## 测试
 
@@ -594,4 +656,4 @@ python scripts/download_minilm.py
 
 ## License
 
-
+MIT License

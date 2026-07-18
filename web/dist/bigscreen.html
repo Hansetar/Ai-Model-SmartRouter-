@@ -1,0 +1,517 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SmartRouter 大屏监控</title>
+    <link rel="stylesheet" href="tailwind.css">
+    <script src="echarts.min.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { background: #0a0e27; color: #e0e6ff; font-family: 'SF Pro Display', -apple-system, sans-serif; overflow: hidden; height: 100vh; }
+        .glow-text { text-shadow: 0 0 10px rgba(59, 130, 246, 0.5), 0 0 20px rgba(59, 130, 246, 0.3); }
+        .card { background: linear-gradient(135deg, rgba(15, 23, 42, 0.9), rgba(30, 41, 59, 0.8)); border: 1px solid rgba(59, 130, 246, 0.2); border-radius: 12px; backdrop-filter: blur(10px); }
+        .pulse-dot { animation: pulse 2s infinite; }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+        .fade-in { animation: fadeIn 0.6s ease-out; }
+        .scroll-list { overflow-y: auto; }
+        .scroll-list::-webkit-scrollbar { width: 4px; }
+        .scroll-list::-webkit-scrollbar-thumb { background: rgba(59, 130, 246, 0.3); border-radius: 2px; }
+        .progress-bar { height: 6px; border-radius: 3px; background: rgba(255,255,255,0.1); overflow: hidden; }
+        .progress-bar-fill { height: 100%; border-radius: 3px; transition: width 0.5s ease; }
+
+        /* 自适应缩放：基于 1920x1080 设计稿 */
+        #app {
+            width: 1920px;
+            height: 1080px;
+            transform-origin: 0 0;
+            position: absolute;
+            top: 0;
+            left: 0;
+        }
+
+        /* 刷新间隔选择器 */
+        .refresh-selector {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            background: rgba(15, 23, 42, 0.6);
+            border: 1px solid rgba(59, 130, 246, 0.2);
+            border-radius: 6px;
+            padding: 2px 6px;
+        }
+        .refresh-selector button {
+            background: none;
+            border: none;
+            color: #64748b;
+            font-size: 11px;
+            padding: 2px 6px;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .refresh-selector button.active {
+            background: rgba(59, 130, 246, 0.3);
+            color: #93c5fd;
+        }
+        .refresh-selector button:hover {
+            color: #93c5fd;
+        }
+
+        /* 模型状态项自适应 */
+        .model-item {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 4px 0;
+            border-bottom: 1px solid rgba(30, 58, 138, 0.3);
+        }
+        .model-item:last-child { border-bottom: none; }
+        .model-name {
+            font-size: 12px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            max-width: 160px;
+        }
+        .model-status {
+            font-size: 11px;
+            flex-shrink: 0;
+            margin-left: 8px;
+        }
+
+        /* 字体缩放：通过 CSS 变量控制 */
+        :root { --font-scale: 1; }
+        #app { font-size: calc(14px * var(--font-scale)); }
+        #app .stat-value { font-size: calc(2.5rem * var(--font-scale)); }
+        #app h1 { font-size: calc(1.25rem * var(--font-scale)); }
+        #app h3 { font-size: calc(0.875rem * var(--font-scale)); }
+        #app .text-xs { font-size: calc(0.75rem * var(--font-scale)); }
+        #app .text-sm { font-size: calc(0.875rem * var(--font-scale)); }
+        #app .model-name { font-size: calc(12px * var(--font-scale)); }
+        #app .model-status { font-size: calc(11px * var(--font-scale)); }
+
+        /* 字体缩放滑块 */
+        .font-scale-control {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            background: rgba(15, 23, 42, 0.6);
+            border: 1px solid rgba(59, 130, 246, 0.2);
+            border-radius: 6px;
+            padding: 2px 8px;
+        }
+        .font-scale-control input[type="range"] {
+            width: 80px;
+            height: 4px;
+            -webkit-appearance: none;
+            appearance: none;
+            background: rgba(59, 130, 246, 0.3);
+            border-radius: 2px;
+            outline: none;
+        }
+        .font-scale-control input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: #3b82f6;
+            cursor: pointer;
+        }
+        .font-scale-control input[type="range"]::-moz-range-thumb {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: #3b82f6;
+            cursor: pointer;
+            border: none;
+        }
+    </style>
+</head>
+<body>
+    <div id="app" class="flex flex-col p-4 gap-4">
+        <!-- 顶部标题栏 -->
+        <header class="flex items-center justify-between px-6 py-3 card">
+            <div class="flex items-center gap-4">
+                <div class="w-10 h-10 bg-gradient-to-br from-blue-500 to-purple-600 rounded-lg flex items-center justify-center text-white font-bold text-lg">SR</div>
+                <div>
+                    <h1 class="text-xl font-bold glow-text">SmartRouter 实时监控大屏</h1>
+                    <p class="text-xs text-blue-300/60">AI Model Smart Routing Platform</p>
+                </div>
+            </div>
+            <div class="flex items-center gap-6 text-sm">
+                <div class="flex items-center gap-2">
+                    <span class="w-2 h-2 rounded-full bg-green-400 pulse-dot"></span>
+                    <span class="text-green-300">系统运行中</span>
+                </div>
+                <div class="text-blue-300/60" id="clock"></div>
+                <div class="refresh-selector">
+                    <span class="text-blue-300/40 text-xs">刷新:</span>
+                    <button data-interval="5" onclick="setRefreshInterval(5)">5s</button>
+                    <button data-interval="10" class="active" onclick="setRefreshInterval(10)">10s</button>
+                    <button data-interval="30" onclick="setRefreshInterval(30)">30s</button>
+                    <button data-interval="60" onclick="setRefreshInterval(60)">60s</button>
+                    <button data-interval="0" onclick="setRefreshInterval(0)">暂停</button>
+                </div>
+                <div class="font-scale-control">
+                    <span class="text-blue-300/40 text-xs">A</span>
+                    <input type="range" id="font-scale-slider" min="0.5" max="2" step="0.05" value="1" oninput="setFontScale(this.value)">
+                    <span class="text-blue-300/60 text-xs" id="font-scale-label">100%</span>
+                </div>
+            </div>
+        </header>
+
+        <!-- 核心指标行 -->
+        <div class="grid grid-cols-6 gap-4">
+            <div class="card p-4 fade-in">
+                <div class="text-xs text-blue-300/60 mb-2">今日请求</div>
+                <div class="stat-value text-blue-400" id="total-requests">0</div>
+            </div>
+            <div class="card p-4 fade-in">
+                <div class="text-xs text-blue-300/60 mb-2">今日花费</div>
+                <div class="stat-value text-amber-400" id="total-cost">¥0</div>
+            </div>
+            <div class="card p-4 fade-in">
+                <div class="text-xs text-blue-300/60 mb-2">输入Token</div>
+                <div class="stat-value text-indigo-400" id="input-tokens">0</div>
+            </div>
+            <div class="card p-4 fade-in">
+                <div class="text-xs text-blue-300/60 mb-2">输出Token</div>
+                <div class="stat-value text-cyan-400" id="output-tokens">0</div>
+            </div>
+            <div class="card p-4 fade-in">
+                <div class="text-xs text-blue-300/60 mb-2">平均延迟</div>
+                <div class="stat-value text-green-400" id="avg-latency">0ms</div>
+            </div>
+            <div class="card p-4 fade-in">
+                <div class="text-xs text-blue-300/60 mb-2">模型数量</div>
+                <div class="stat-value text-purple-400" id="model-count">0</div>
+            </div>
+        </div>
+
+        <!-- 图表行 -->
+        <div class="grid grid-cols-4 gap-4 flex-1 min-h-0">
+            <div class="card p-4 flex flex-col">
+                <h3 class="text-sm font-semibold text-blue-300/80 mb-2">模型调用占比</h3>
+                <div class="flex-1" id="pie-chart"></div>
+            </div>
+            <div class="card p-4 flex flex-col">
+                <h3 class="text-sm font-semibold text-blue-300/80 mb-2">请求量与成本趋势</h3>
+                <div class="flex-1" id="line-chart"></div>
+            </div>
+            <div class="card p-4 flex flex-col">
+                <h3 class="text-sm font-semibold text-blue-300/80 mb-2">任务类型分布</h3>
+                <div class="flex-1" id="task-pie-chart"></div>
+            </div>
+            <div class="card p-4 flex flex-col">
+                <h3 class="text-sm font-semibold text-blue-300/80 mb-2">模态调用热力图</h3>
+                <div class="flex-1" id="modality-heatmap"></div>
+            </div>
+        </div>
+
+        <!-- 底部信息行 -->
+        <div class="grid grid-cols-3 gap-4">
+            <!-- 并发状态 -->
+            <div class="card p-4">
+                <h3 class="text-sm font-semibold text-blue-300/80 mb-3">并发状态</h3>
+                <div class="flex items-center justify-between mb-2">
+                    <span class="text-xs text-blue-300/60">当前使用</span>
+                    <span class="text-sm font-bold" id="concurrency-text">0 / 50</span>
+                </div>
+                <div class="progress-bar">
+                    <div class="progress-bar-fill bg-gradient-to-r from-blue-500 to-purple-500" id="concurrency-bar" style="width: 0%"></div>
+                </div>
+                <div class="flex items-center justify-between mt-3">
+                    <span class="text-xs text-blue-300/60">预测引擎</span>
+                    <span class="text-xs font-bold" id="predictor-status">检测中...</span>
+                </div>
+            </div>
+            <!-- 模型列表 -->
+            <div class="card p-4 flex flex-col">
+                <h3 class="text-sm font-semibold text-blue-300/80 mb-3">模型状态</h3>
+                <div class="scroll-list flex-1" id="model-list" style="max-height: 200px;"></div>
+            </div>
+            <!-- 慢查询告警 -->
+            <div class="card p-4 flex flex-col">
+                <h3 class="text-sm font-semibold text-blue-300/80 mb-3">慢查询告警 (>5s)</h3>
+                <div class="scroll-list flex-1" id="slow-queries" style="max-height: 200px;">
+                    <div class="text-xs text-green-300/60 text-center py-4">暂无慢查询</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let pieInst = null, lineInst = null, taskPieInst = null, modalityHeatInst = null;
+        let refreshTimer = null;
+        let currentInterval = 10;
+
+        const darkTheme = {
+            textStyle: { color: '#94a3b8' },
+            legend: { textStyle: { color: '#94a3b8' }, bottom: 0, type: 'scroll' },
+        };
+
+        // ========== 自适应缩放 ==========
+        function autoScale() {
+            const app = document.getElementById('app');
+            const designW = 1920, designH = 1080;
+            const scaleX = window.innerWidth / designW;
+            const scaleY = window.innerHeight / designH;
+            const scale = Math.min(scaleX, scaleY);
+            app.style.transform = 'scale(' + scale + ')';
+            var offsetX = (window.innerWidth - designW * scale) / 2;
+            var offsetY = (window.innerHeight - designH * scale) / 2;
+            app.style.left = offsetX + 'px';
+            app.style.top = offsetY + 'px';
+        }
+        autoScale();
+        window.addEventListener('resize', function() {
+            autoScale();
+            if (pieInst) pieInst.resize();
+            if (lineInst) lineInst.resize();
+            if (taskPieInst) taskPieInst.resize();
+            if (modalityHeatInst) modalityHeatInst.resize();
+        });
+
+        // ========== 刷新间隔控制 ==========
+        function setRefreshInterval(seconds) {
+            currentInterval = seconds;
+            document.querySelectorAll('.refresh-selector button').forEach(function(btn) {
+                var val = parseInt(btn.dataset.interval);
+                btn.classList.toggle('active', val === seconds);
+            });
+            if (refreshTimer) {
+                clearInterval(refreshTimer);
+                refreshTimer = null;
+            }
+            if (seconds > 0) {
+                refreshTimer = setInterval(refresh, seconds * 1000);
+            }
+        }
+
+        // ========== 字体缩放控制 ==========
+        function setFontScale(val) {
+            var scale = parseFloat(val);
+            document.documentElement.style.setProperty('--font-scale', scale);
+            document.getElementById('font-scale-label').textContent = Math.round(scale * 100) + '%';
+            try { localStorage.setItem('bigscreen-font-scale', val); } catch(e) {}
+        }
+        // 恢复上次设置
+        (function() {
+            try {
+                var saved = localStorage.getItem('bigscreen-font-scale');
+                if (saved) {
+                    var scale = parseFloat(saved);
+                    if (scale >= 0.5 && scale <= 2) {
+                        document.documentElement.style.setProperty('--font-scale', scale);
+                        document.getElementById('font-scale-slider').value = scale;
+                        document.getElementById('font-scale-label').textContent = Math.round(scale * 100) + '%';
+                    }
+                }
+            } catch(e) {}
+        })();
+
+        function formatCount(n) {
+            if (n >= 1e9) return (n / 1e9).toFixed(1) + 'B';
+            if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+            if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+            return String(n);
+        }
+
+        function updateClock() {
+            var now = new Date();
+            document.getElementById('clock').textContent = now.toLocaleString('zh-CN', { hour12: false });
+        }
+        setInterval(updateClock, 1000);
+        updateClock();
+
+        async function fetchData() {
+            try {
+                var resp = await fetch('/admin/api/bigscreen');
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                return await resp.json();
+            } catch (e) {
+                console.error('Fetch error:', e);
+                return null;
+            }
+        }
+
+        function renderPie(data) {
+            var el = document.getElementById('pie-chart');
+            if (!el) return;
+            if (pieInst && (!pieInst.getDom() || !pieInst.getDom().isConnected)) { pieInst.dispose(); pieInst = null; }
+            if (!pieInst) pieInst = echarts.init(el, null, { renderer: 'canvas' });
+            var items = (data.stats && data.stats.model_distribution || []).map(function(d) { return { name: d.name || '未知', value: d.count }; });
+            pieInst.setOption({
+                textStyle: { color: '#94a3b8' },
+                legend: { textStyle: { color: '#94a3b8' }, bottom: 0, type: 'scroll' },
+                tooltip: { trigger: 'item', formatter: '{b}: {c} ({d}%)' },
+                series: [{
+                    type: 'pie', radius: ['35%', '65%'], center: ['50%', '45%'],
+                    data: items.length ? items : [{ name: '暂无数据', value: 1 }],
+                    itemStyle: { borderRadius: 4, borderColor: '#0a0e27', borderWidth: 2 },
+                    label: { color: '#94a3b8', fontSize: 10, formatter: '{b}\n{d}%' },
+                }],
+                color: ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899', '#14b8a6', '#f97316'],
+            });
+        }
+
+        function renderLine(data) {
+            var el = document.getElementById('line-chart');
+            if (!el) return;
+            if (lineInst && (!lineInst.getDom() || !lineInst.getDom().isConnected)) { lineInst.dispose(); lineInst = null; }
+            if (!lineInst) lineInst = echarts.init(el, null, { renderer: 'canvas' });
+            var trend = (data.stats && data.stats.daily_trend) || [];
+            lineInst.setOption({
+                textStyle: { color: '#94a3b8' },
+                legend: { textStyle: { color: '#94a3b8' }, bottom: 0, type: 'scroll' },
+                tooltip: { trigger: 'axis' },
+                grid: { left: 50, right: 50, bottom: 30, top: 30 },
+                xAxis: { type: 'category', data: trend.map(function(t) { return t.day; }), axisLine: { lineStyle: { color: '#334155' } }, axisLabel: { color: '#64748b', fontSize: 10 } },
+                yAxis: [
+                    { type: 'value', name: '请求量', nameTextStyle: { color: '#64748b' }, axisLine: { lineStyle: { color: '#334155' } }, splitLine: { lineStyle: { color: '#1e293b' } }, axisLabel: { color: '#64748b' } },
+                    { type: 'value', name: '成本', nameTextStyle: { color: '#64748b' }, axisLine: { lineStyle: { color: '#334155' } }, splitLine: { show: false }, axisLabel: { color: '#64748b' } },
+                ],
+                series: [
+                    { name: '请求量', type: 'bar', data: trend.map(function(t) { return t.req; }), itemStyle: { color: 'rgba(59, 130, 246, 0.6)', borderRadius: [3, 3, 0, 0] } },
+                    { name: '成本', type: 'line', yAxisIndex: 1, smooth: true, data: trend.map(function(t) { return t.cost; }), itemStyle: { color: '#f59e0b' }, areaStyle: { color: { type: 'linear', x: 0, y: 0, x2: 0, y2: 1, colorStops: [{ offset: 0, color: 'rgba(245, 158, 11, 0.3)' }, { offset: 1, color: 'rgba(245, 158, 11, 0)' }] } } },
+                ],
+            });
+        }
+
+        function renderTaskPie(data) {
+            var el = document.getElementById('task-pie-chart');
+            if (!el) return;
+            if (taskPieInst && (!taskPieInst.getDom() || !taskPieInst.getDom().isConnected)) { taskPieInst.dispose(); taskPieInst = null; }
+            if (!taskPieInst) taskPieInst = echarts.init(el, null, { renderer: 'canvas' });
+            var items = (data.stats && data.stats.task_type_distribution || []).map(function(d) { return { name: d.task_type || 'chat', value: d.count }; });
+            taskPieInst.setOption({
+                textStyle: { color: '#94a3b8' },
+                legend: { textStyle: { color: '#94a3b8' }, bottom: 0, type: 'scroll' },
+                tooltip: { trigger: 'item', formatter: '{b}: {c} ({d}%)' },
+                series: [{
+                    type: 'pie', radius: ['35%', '65%'], center: ['50%', '45%'],
+                    data: items.length ? items : [{ name: '暂无数据', value: 1 }],
+                    itemStyle: { borderRadius: 4, borderColor: '#0a0e27', borderWidth: 2 },
+                    label: { color: '#94a3b8', fontSize: 10, formatter: '{b}\n{d}%' },
+                }],
+                color: ['#8b5cf6', '#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#ec4899', '#14b8a6'],
+            });
+        }
+
+        function renderModalityHeatmap(data) {
+            var el = document.getElementById('modality-heatmap');
+            if (!el) return;
+            if (modalityHeatInst && (!modalityHeatInst.getDom() || !modalityHeatInst.getDom().isConnected)) { modalityHeatInst.dispose(); modalityHeatInst = null; }
+            if (!modalityHeatInst) modalityHeatInst = echarts.init(el, null, { renderer: 'canvas' });
+            var raw = (data.stats && data.stats.daily_modality_trend) || [];
+            var modOrder = ['text', 'image', 'audio', 'video', 'file'];
+            var daySet = {};
+            var modDays = {};
+            raw.forEach(function(d) {
+                daySet[d.day] = true;
+                var mods = (d.content_types || '').split(',');
+                mods.forEach(function(m) {
+                    m = m.trim();
+                    if (!m) return;
+                    if (!modDays[m]) modDays[m] = {};
+                    modDays[m][d.day] = (modDays[m][d.day] || 0) + d.count;
+                });
+            });
+            var days = Object.keys(daySet).sort().slice(-14);
+            var heatData = [];
+            var maxVal = 0;
+            for (var mi = 0; mi < modOrder.length; mi++) {
+                for (var di = 0; di < days.length; di++) {
+                    var val = (modDays[modOrder[mi]] && modDays[modOrder[mi]][days[di]]) || 0;
+                    heatData.push([di, mi, val]);
+                    if (val > maxVal) maxVal = val;
+                }
+            }
+            modalityHeatInst.setOption({
+                textStyle: { color: '#94a3b8' },
+                tooltip: { formatter: function(p) { return p.data[2] + ' 次'; } },
+                grid: { left: 50, right: 20, top: 10, bottom: 30 },
+                xAxis: { type: 'category', data: days.map(function(d) { return d.slice(5); }), axisLabel: { color: '#64748b', fontSize: 9 }, splitArea: { show: true, areaStyle: { color: ['rgba(15,23,42,0.3)', 'rgba(30,41,59,0.3)'] } } },
+                yAxis: { type: 'category', data: modOrder, axisLabel: { color: '#94a3b8', fontSize: 10 } },
+                visualMap: { min: 0, max: maxVal || 1, show: false, inRange: { color: ['#0f172a', '#1e3a5f', '#3b82f6', '#8b5cf6', '#f59e0b'] } },
+                series: [{
+                    type: 'heatmap', data: heatData, label: { show: true, color: '#e0e6ff', fontSize: 9, formatter: function(p) { return p.data[2] || ''; } },
+                    itemStyle: { borderRadius: 3, borderColor: '#0a0e27', borderWidth: 2 },
+                    emphasis: { itemStyle: { shadowBlur: 10, shadowColor: 'rgba(59,130,246,0.5)' } }
+                }]
+            });
+        }
+
+        function updateStats(data) {
+            var stats = data.stats || {};
+            document.getElementById('total-requests').textContent = formatCount(stats.total_interceptions || 0);
+            var currencySymbol = (stats.cost_currency === 'CNY') ? '\u00a5' : '$';
+            document.getElementById('total-cost').textContent = currencySymbol + (stats.saved_cost || 0).toFixed(4);
+            document.getElementById('input-tokens').textContent = formatCount(stats.total_input_tokens || 0);
+            document.getElementById('output-tokens').textContent = formatCount(stats.total_output_tokens || 0);
+            document.getElementById('avg-latency').textContent = (stats.avg_latency_ms || 0).toFixed(0) + 'ms';
+            document.getElementById('model-count').textContent = data.model_count || 0;
+
+            // 并发状态
+            var conc = data.concurrency || {};
+            document.getElementById('concurrency-text').textContent = (conc.in_use || 0) + ' / ' + (conc.max || 0);
+            var pct = conc.max ? ((conc.in_use || 0) / conc.max * 100) : 0;
+            document.getElementById('concurrency-bar').style.width = pct + '%';
+
+            // 预测引擎
+            var pred = data.predictor || {};
+            var predEl = document.getElementById('predictor-status');
+            predEl.textContent = pred.is_ready ? '就绪' : '冷启动中';
+            predEl.className = 'text-xs font-bold ' + (pred.is_ready ? 'text-green-400' : 'text-yellow-400');
+
+            // 模型列表
+            var models = data.models || [];
+            var modelListEl = document.getElementById('model-list');
+            var itemHeight = 28;
+            var maxVisibleItems = 7;
+            var calcHeight = Math.min(models.length, maxVisibleItems) * itemHeight;
+            modelListEl.style.maxHeight = Math.max(calcHeight, 60) + 'px';
+
+            modelListEl.innerHTML = models.map(function(m) {
+                return '<div class="model-item">' +
+                    '<span class="model-name ' + (m.enabled ? 'text-blue-200' : 'text-gray-500') + '" title="' + m.name + '">' + m.name + '</span>' +
+                    '<span class="model-status ' + (m.enabled ? 'text-green-400' : 'text-gray-600') + '">' + (m.enabled ? '启用' : '禁用') + '</span>' +
+                '</div>';
+            }).join('');
+
+            // 慢查询
+            var slowQueries = data.recent_slow_queries || [];
+            var slowEl = document.getElementById('slow-queries');
+            if (slowQueries.length === 0) {
+                slowEl.innerHTML = '<div class="text-xs text-green-300/60 text-center py-4">暂无慢查询</div>';
+            } else {
+                slowEl.innerHTML = slowQueries.map(function(q) {
+                    var time = new Date(q.timestamp * 1000).toLocaleTimeString('zh-CN', { hour12: false });
+                    return '<div class="flex items-center justify-between py-1 border-b border-red-900/30">' +
+                        '<span class="text-xs text-red-300">' + q.method + ' ' + q.path + '</span>' +
+                        '<span class="text-xs text-red-400">' + q.elapsed_ms + 'ms</span>' +
+                        '<span class="text-xs text-gray-500">' + time + '</span>' +
+                    '</div>';
+                }).join('');
+            }
+        }
+
+        async function refresh() {
+            var data = await fetchData();
+            if (!data) return;
+            updateStats(data);
+            renderPie(data);
+            renderLine(data);
+            renderTaskPie(data);
+            renderModalityHeatmap(data);
+        }
+
+        // 初始化
+        refresh();
+        refreshTimer = setInterval(refresh, currentInterval * 1000);
+    </script>
+</body>
+</html>

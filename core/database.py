@@ -39,7 +39,9 @@ CREATE TABLE IF NOT EXISTS request_logs (
     prompt_preview      TEXT,
     requested_model     TEXT,
     prompt_tokens       INTEGER DEFAULT 0,
-    completion_tokens   INTEGER DEFAULT 0
+    completion_tokens   INTEGER DEFAULT 0,
+    route_chain         TEXT,
+    content_types       TEXT
 );
 """
 
@@ -90,6 +92,30 @@ CREATE INDEX IF NOT EXISTS idx_request_logs_ts ON request_logs(timestamp);
 CREATE INDEX IF NOT EXISTS idx_request_logs_model ON request_logs(routed_model);
 CREATE INDEX IF NOT EXISTS idx_request_logs_task ON request_logs(task_type);
 CREATE INDEX IF NOT EXISTS idx_training_samples_source ON training_samples(source);
+
+CREATE TABLE IF NOT EXISTS api_logs (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp           REAL    NOT NULL,
+    request_id          TEXT,
+    method              TEXT,
+    path                TEXT,
+    requested_model     TEXT,
+    routed_model        TEXT,
+    route_source        TEXT,
+    status_code         INTEGER,
+    error_message       TEXT,
+    latency_ms          INTEGER,
+    prompt_tokens       INTEGER DEFAULT 0,
+    completion_tokens   INTEGER DEFAULT 0,
+    cost                REAL,
+    cost_currency       TEXT    DEFAULT 'CNY',
+    prompt_preview      TEXT,
+    client_ip           TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_api_logs_ts ON api_logs(timestamp);
+CREATE INDEX IF NOT EXISTS idx_api_logs_model ON api_logs(routed_model);
+CREATE INDEX IF NOT EXISTS idx_api_logs_status ON api_logs(status_code);
 """
 
 
@@ -167,6 +193,12 @@ class Database:
             if columns and "completion_tokens" not in columns:
                 conn.execute("ALTER TABLE request_logs ADD COLUMN completion_tokens INTEGER DEFAULT 0")
                 conn.commit()
+            if columns and "route_chain" not in columns:
+                conn.execute("ALTER TABLE request_logs ADD COLUMN route_chain TEXT")
+                conn.commit()
+            if columns and "content_types" not in columns:
+                conn.execute("ALTER TABLE request_logs ADD COLUMN content_types TEXT")
+                conn.commit()
             # 训练样本表新增标记字段
             cur2 = conn.execute("PRAGMA table_info(training_samples)")
             ts_columns = [row["name"] for row in cur2.fetchall()]
@@ -218,13 +250,15 @@ class Database:
         requested_model: Optional[str] = None,
         prompt_tokens: int = 0,
         completion_tokens: int = 0,
+        route_chain: Optional[str] = None,
+        content_types: Optional[str] = None,
     ) -> None:
         sql = (
             "INSERT INTO request_logs "
             "(timestamp, prompt_hash, predicted_difficulty, actual_difficulty, "
             " routed_model, cost, cost_currency, latency_ms, success, task_type, "
-            " route_source, prompt_preview, requested_model, prompt_tokens, completion_tokens) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            " route_source, prompt_preview, requested_model, prompt_tokens, completion_tokens, route_chain, content_types) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
         params = (
             time.time(),
@@ -242,6 +276,8 @@ class Database:
             requested_model,
             prompt_tokens,
             completion_tokens,
+            route_chain,
+            content_types,
         )
         self._write_queue.put((sql, params))
 
@@ -461,6 +497,21 @@ class Database:
                 f"FROM request_logs {where} "
                 f"GROUP BY routed_model, cost_currency", params
             ).fetchall()
+            # 模态分布统计
+            modality_dist = conn.execute(
+                f"SELECT content_types, COUNT(*) AS count "
+                f"FROM request_logs {where} "
+                f"{'AND' if where else 'WHERE'} content_types IS NOT NULL AND content_types != '' "
+                f"GROUP BY content_types", params
+            ).fetchall()
+            # 每日模态趋势（按天+模态分组）
+            daily_modality = conn.execute(
+                f"SELECT date(timestamp,'unixepoch') AS day, "
+                f"content_types, COUNT(*) AS count "
+                f"FROM request_logs {where} "
+                f"{'AND' if where else 'WHERE'} content_types IS NOT NULL AND content_types != '' "
+                f"GROUP BY day, content_types ORDER BY day", params
+            ).fetchall()
         return {
             "total_interceptions": total,
             "saved_cost_by_currency": [dict(r) for r in saved_by_currency],
@@ -473,6 +524,8 @@ class Database:
             "task_type_distribution": [dict(r) for r in task_dist],
             "task_type_stats": [dict(r) for r in task_stats],
             "model_token_stats": [dict(r) for r in model_token_stats],
+            "modality_distribution": [dict(r) for r in modality_dist],
+            "daily_modality_trend": [dict(r) for r in daily_modality],
         }
 
     def get_negative_feedback_conversations(self, limit: int = 50) -> List[Dict[str, Any]]:
@@ -757,6 +810,144 @@ class Database:
             "total_logs": total,
             "source_distribution": [dict(r) for r in source_stats],
             "model_distribution": [dict(r) for r in model_stats],
+            "earliest_log": time_range["earliest"],
+            "latest_log": time_range["latest"],
+        }
+
+    # ------------------------------------------------------------------ #
+    # API 调用日志
+    # ------------------------------------------------------------------ #
+    def log_api_call(
+        self,
+        request_id: str,
+        method: str,
+        path: str,
+        requested_model: Optional[str] = None,
+        routed_model: Optional[str] = None,
+        route_source: Optional[str] = None,
+        status_code: int = 200,
+        error_message: Optional[str] = None,
+        latency_ms: int = 0,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        cost: float = 0.0,
+        cost_currency: str = "CNY",
+        prompt_preview: Optional[str] = None,
+        client_ip: Optional[str] = None,
+    ) -> None:
+        """记录 API 调用日志（异步写入）。"""
+        sql = (
+            "INSERT INTO api_logs "
+            "(timestamp, request_id, method, path, requested_model, routed_model, "
+            " route_source, status_code, error_message, latency_ms, prompt_tokens, "
+            " completion_tokens, cost, cost_currency, prompt_preview, client_ip) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        )
+        params = (
+            time.time(),
+            request_id,
+            method,
+            path,
+            requested_model,
+            routed_model,
+            route_source,
+            status_code,
+            error_message,
+            latency_ms,
+            prompt_tokens,
+            completion_tokens,
+            cost,
+            cost_currency,
+            prompt_preview,
+            client_ip,
+        )
+        self._write_queue.put((sql, params))
+
+    def get_api_logs(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        model: Optional[str] = None,
+        status_code: Optional[int] = None,
+        path: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """获取 API 调用日志列表。"""
+        with self._connect() as conn:
+            conditions = []
+            params: list = []
+            if model:
+                conditions.append("(requested_model=? OR routed_model=?)")
+                params.extend([model, model])
+            if status_code:
+                conditions.append("status_code=?")
+                params.append(status_code)
+            if path:
+                conditions.append("path=?")
+                params.append(path)
+            where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+            cur = conn.execute(
+                f"SELECT * FROM api_logs{where} ORDER BY id DESC LIMIT ? OFFSET ?",
+                params + [limit, offset],
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    def count_api_logs(self, model: Optional[str] = None, status_code: Optional[int] = None) -> int:
+        """统计 API 调用日志数量。"""
+        with self._connect() as conn:
+            conditions = []
+            params: list = []
+            if model:
+                conditions.append("(requested_model=? OR routed_model=?)")
+                params.extend([model, model])
+            if status_code:
+                conditions.append("status_code=?")
+                params.append(status_code)
+            where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+            cur = conn.execute(f"SELECT COUNT(*) AS c FROM api_logs{where}", params)
+            return cur.fetchone()["c"]
+
+    def clear_old_api_logs(self, max_age_days: int = 30) -> int:
+        """清除超过指定天数的 API 日志，返回删除数量。"""
+        if max_age_days <= 0:
+            return 0
+        cutoff = time.time() - (max_age_days * 86400)
+        with self._connect() as conn:
+            cur = conn.execute("DELETE FROM api_logs WHERE timestamp < ?", (cutoff,))
+            conn.commit()
+            return cur.rowcount
+
+    def clear_all_api_logs(self) -> int:
+        """清除所有 API 日志，返回删除数量。"""
+        with self._connect() as conn:
+            cur = conn.execute("DELETE FROM api_logs")
+            conn.commit()
+            return cur.rowcount
+
+    def get_api_log_stats(self) -> Dict[str, Any]:
+        """获取 API 调用日志统计信息。"""
+        with self._connect() as conn:
+            total = conn.execute("SELECT COUNT(*) AS c FROM api_logs").fetchone()["c"]
+            # 按状态码统计
+            status_stats = conn.execute(
+                "SELECT status_code, COUNT(*) AS count FROM api_logs GROUP BY status_code ORDER BY count DESC"
+            ).fetchall()
+            # 按路由模型统计
+            model_stats = conn.execute(
+                "SELECT routed_model, COUNT(*) AS count, AVG(latency_ms) AS avg_latency, AVG(cost) AS avg_cost FROM api_logs WHERE routed_model IS NOT NULL GROUP BY routed_model ORDER BY count DESC"
+            ).fetchall()
+            # 按路径统计
+            path_stats = conn.execute(
+                "SELECT path, COUNT(*) AS count FROM api_logs GROUP BY path ORDER BY count DESC"
+            ).fetchall()
+            # 最早和最晚日志时间
+            time_range = conn.execute(
+                "SELECT MIN(timestamp) AS earliest, MAX(timestamp) AS latest FROM api_logs"
+            ).fetchone()
+        return {
+            "total_logs": total,
+            "status_distribution": [dict(r) for r in status_stats],
+            "model_distribution": [dict(r) for r in model_stats],
+            "path_distribution": [dict(r) for r in path_stats],
             "earliest_log": time_range["earliest"],
             "latest_log": time_range["latest"],
         }

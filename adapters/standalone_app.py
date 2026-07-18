@@ -17,6 +17,8 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
+import json
+import logging
 import os
 import time
 import uuid
@@ -28,6 +30,11 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+
+# ---------------------------------------------------------------------- #
+# 并发控制信号量（全局，在 create_app 中初始化）
+# ---------------------------------------------------------------------- #
+_concurrency_semaphore: Optional[asyncio.Semaphore] = None
 
 # OpenAI 兼容的错误响应格式
 class OpenAIError(HTTPException):
@@ -58,6 +65,39 @@ from core import config, db, feedback_analyzer, predictor, pricing_manager, rout
 from core.router import detect_task_type, detect_model_keyword, task_type_detector
 from core.exchange_rate import exchange_rate_manager
 from core.fallback_logger import fallback_logger
+from core.notifier import notifier
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------- #
+# API 响应内存缓存
+# ---------------------------------------------------------------------- #
+_api_cache: Dict[str, tuple] = {}  # key -> (data, expire_time)
+
+
+def _cache_get(key: str) -> Optional[Any]:
+    """获取缓存数据，过期返回 None。"""
+    entry = _api_cache.get(key)
+    if entry is None:
+        return None
+    data, expire = entry
+    if time.time() > expire:
+        del _api_cache[key]
+        return None
+    return data
+
+
+def _cache_set(key: str, data: Any, ttl: float = 10.0) -> None:
+    """设置缓存数据，默认 TTL 10秒。"""
+    _api_cache[key] = (data, time.time() + ttl)
+    # 清理过期缓存（简单策略：超过 100 条时清理）
+    if len(_api_cache) > 100:
+        now = time.time()
+        expired = [k for k, (_, e) in _api_cache.items() if now > e]
+        for k in expired:
+            del _api_cache[k]
+
+
 from core.auth import (
     create_access_token,
     is_api_key_configured,
@@ -119,6 +159,10 @@ def create_app(predictor_instance=None) -> FastAPI:
         version="1.0.0",
     )
 
+    # Gzip 压缩中间件：大幅减少传输体积（JS/CSS/JSON 通常可压缩 60-80%）
+    from starlette.middleware.gzip import GZipMiddleware
+    app.add_middleware(GZipMiddleware, minimum_size=500)
+
     # CORS
     app.add_middleware(
         CORSMiddleware,
@@ -127,6 +171,95 @@ def create_app(predictor_instance=None) -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    # 慢查询监控中间件：记录超过阈值的请求，帮助发现性能问题
+    _SLOW_QUERY_THRESHOLD_MS = 5000  # 5秒
+    _slow_query_log: list = []  # 保留最近50条慢查询记录
+    _MAX_SLOW_QUERIES = 50
+
+    @app.middleware("http")
+    async def slow_query_middleware(request: Request, call_next):
+        start_time = time.time()
+        response = await call_next(request)
+        elapsed_ms = int((time.time() - start_time) * 1000)
+
+        if elapsed_ms > _SLOW_QUERY_THRESHOLD_MS:
+            logger.warning(
+                "慢查询告警: %s %s 耗时 %dms (阈值 %dms)",
+                request.method, request.url.path, elapsed_ms, _SLOW_QUERY_THRESHOLD_MS
+            )
+            record = {
+                "timestamp": time.time(),
+                "method": request.method,
+                "path": request.url.path,
+                "elapsed_ms": elapsed_ms,
+                "status_code": response.status_code if response else 0,
+            }
+            _slow_query_log.append(record)
+            # 保留最近50条
+            if len(_slow_query_log) > _MAX_SLOW_QUERIES:
+                _slow_query_log.pop(0)
+
+        return response
+
+    # API 调用日志中间件：记录所有 /v1/ 请求
+    @app.middleware("http")
+    async def api_log_middleware(request: Request, call_next):
+        # 只记录 /v1/ 路径的 API 请求
+        if not request.url.path.startswith("/v1/"):
+            return await call_next(request)
+
+        start_time = time.time()
+        response = None
+        error_msg = None
+
+        try:
+            response = await call_next(request)
+        except Exception as exc:
+            error_msg = str(exc)[:500]
+            raise
+
+        finally:
+            try:
+                latency_ms = int((time.time() - start_time) * 1000)
+                status_code = response.status_code if response else 500
+
+                # 从 request.state 获取路由信息（由 proxy 函数设置）
+                routed_model = getattr(request.state, "_api_routed_model", None)
+                route_source = getattr(request.state, "_api_route_source", None)
+                requested_model = getattr(request.state, "_api_requested_model", None)
+                prompt_tokens = getattr(request.state, "_api_prompt_tokens", 0)
+                completion_tokens = getattr(request.state, "_api_completion_tokens", 0)
+                cost = getattr(request.state, "_api_cost", 0.0)
+                cost_currency = getattr(request.state, "_api_cost_currency", config.currency)
+                prompt_preview = getattr(request.state, "_api_prompt_preview", None)
+
+                # 获取客户端 IP
+                client_ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+                if not client_ip:
+                    client_ip = request.client.host if request.client else None
+
+                db.log_api_call(
+                    request_id=getattr(request.state, "_api_request_id", ""),
+                    method=request.method,
+                    path=request.url.path,
+                    requested_model=requested_model,
+                    routed_model=routed_model,
+                    route_source=route_source,
+                    status_code=status_code,
+                    error_message=error_msg,
+                    latency_ms=latency_ms,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    cost=cost,
+                    cost_currency=cost_currency,
+                    prompt_preview=prompt_preview,
+                    client_ip=client_ip,
+                )
+            except Exception:
+                pass  # 日志写入不能影响主流程
+
+        return response
 
     # 全局异常处理器：确保所有错误响应都符合 OpenAI 格式
     @app.exception_handler(HTTPException)
@@ -174,9 +307,87 @@ def create_app(predictor_instance=None) -> FastAPI:
     app.state.fallback_logger = fallback_logger
 
     # ------------------------------------------------------------------ #
+    # 全局 httpx 异步客户端（连接池复用，避免每次请求创建新客户端）
+    # ------------------------------------------------------------------ #
+    _http_client: Optional[httpx.AsyncClient] = None
+
+    # 并发控制信号量（默认 50 并发，可通过环境变量调整）
+    max_concurrency = int(os.environ.get("SMARTROUTER_MAX_CONCURRENCY", "50"))
+    global _concurrency_semaphore
+    _concurrency_semaphore = asyncio.Semaphore(max_concurrency)
+
+    async def _get_http_client() -> httpx.AsyncClient:
+        """获取或创建全局 httpx 异步客户端（懒初始化）。"""
+        nonlocal _http_client
+        if _http_client is None or _http_client.is_closed:
+            _http_client = httpx.AsyncClient(
+                timeout=httpx.Timeout(120.0, connect=10.0),
+                limits=httpx.Limits(
+                    max_connections=100,
+                    max_keepalive_connections=20,
+                    keepalive_expiry=60,
+                ),
+            )
+        return _http_client
+
+    # ------------------------------------------------------------------ #
+    # 定时任务：自动应用超过24h未确认的 pending_modalities
+    # ------------------------------------------------------------------ #
+    _pending_modality_task: asyncio.Task | None = None
+
+    async def _auto_apply_pending_modalities_loop():
+        """每小时检查一次，将超过24h未确认的 pending_modalities 自动应用。"""
+        while True:
+            try:
+                await asyncio.sleep(3600)  # 每小时检查一次
+                import time as _time
+                AUTO_CONFIRM_SECONDS = 24 * 3600
+                now_ts = _time.time()
+                raw_models = config.get("models", [])
+                auto_applied = []
+                for m in raw_models:
+                    pending = m.get("pending_modalities")
+                    detected_at = m.get("pending_modalities_detected_at")
+                    if pending is not None and detected_at is not None:
+                        if now_ts - detected_at >= AUTO_CONFIRM_SECONDS:
+                            m["modalities"] = pending
+                            m["pending_modalities"] = None
+                            m["pending_modalities_detected_at"] = None
+                            auto_applied.append(m.get("name"))
+                if auto_applied:
+                    config.set("models", raw_models)
+                    try:
+                        config.save()
+                    except Exception:
+                        pass
+                    logger.info("自动应用 pending_modalities: %s", auto_applied)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.warning("自动应用 pending_modalities 出错: %s", e)
+
+    @app.on_event("startup")
+    async def _start_background_tasks():
+        nonlocal _pending_modality_task
+        _pending_modality_task = asyncio.create_task(_auto_apply_pending_modalities_loop())
+
+    @app.on_event("shutdown")
+    async def _shutdown_http_client():
+        """应用关闭时清理 httpx 客户端和定时任务。"""
+        nonlocal _http_client, _pending_modality_task
+        if _pending_modality_task:
+            _pending_modality_task.cancel()
+            _pending_modality_task = None
+        if _http_client and not _http_client.is_closed:
+            await _http_client.aclose()
+            _http_client = None
+
+    # ------------------------------------------------------------------ #
     # 工具函数
     # ------------------------------------------------------------------ #
     def _hash_prompt(prompt: str) -> str:
+        if not isinstance(prompt, str):
+            prompt = str(prompt) if prompt is not None else ""
         return hashlib.md5(prompt.encode("utf-8")).hexdigest()
 
     def _get_unit_divisor(price_unit: str) -> float:
@@ -195,11 +406,71 @@ def create_app(predictor_instance=None) -> FastAPI:
         except (ValueError, TypeError):
             return 1_000_000
 
+    def _extract_text_from_content(content: Any) -> str:
+        """从 content 字段提取纯文本，兼容多模态格式。
+
+        OpenAI 多模态格式中 content 可以是：
+        - 字符串: "Hello"
+        - 列表: [{"type": "text", "text": "Hello"}, {"type": "image_url", ...}]
+        """
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            text_parts = []
+            for item in content:
+                if isinstance(item, str):
+                    text_parts.append(item)
+                elif isinstance(item, dict) and item.get("type") == "text":
+                    text_parts.append(item.get("text", ""))
+            return " ".join(text_parts)
+        return str(content) if content is not None else ""
+
+    def _detect_content_types(body: Dict[str, Any]) -> List[str]:
+        """检测请求中包含的内容类型（text, image, audio, video）。
+
+        扫描所有 messages 中的 content 字段，返回涉及的内容类型列表。
+        用于路由时过滤不支持多模态的模型。
+        """
+        types: set = set()
+        messages = body.get("messages", [])
+        for msg in messages:
+            content = msg.get("content")
+            if isinstance(content, str):
+                types.add("text")
+            elif isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict):
+                        item_type = item.get("type", "")
+                        if item_type == "text":
+                            types.add("text")
+                        elif item_type == "image_url":
+                            types.add("image")
+                        elif item_type == "image_file":
+                            types.add("image")
+                        elif item_type == "input_image":
+                            types.add("image")
+                        elif item_type == "audio_url":
+                            types.add("audio")
+                        elif item_type == "input_audio":
+                            types.add("audio")
+                        elif item_type == "video_url":
+                            types.add("video")
+                        elif item_type == "video_file":
+                            types.add("video")
+                        elif item_type == "input_video":
+                            types.add("video")
+                        elif item_type == "file_url":
+                            types.add("file")
+        if not types:
+            types.add("text")
+        return list(types)
+
     def _extract_prompt(body: Dict[str, Any]) -> str:
         messages = body.get("messages", [])
         if not messages:
             return ""
-        return messages[-1].get("content", "")
+        content = messages[-1].get("content", "")
+        return _extract_text_from_content(content)
 
     def _build_upstream_url(selected: Dict[str, Any]) -> str:
         """构建上游请求 URL。
@@ -284,11 +555,31 @@ def create_app(predictor_instance=None) -> FastAPI:
         }
 
     def _build_upstream_headers(selected: Dict[str, Any]) -> Dict[str, str]:
-        """构建上游请求头，空 API Key 时不发送 Authorization。"""
+        """构建上游请求头。
+
+        严格使用模型/Provider 配置的 api_key，绝不使用用户的认证 key。
+        用户的 api_key 仅用于 /v1 接口的身份认证（check_api_key），
+        路由做中转代理时必须使用自身配置的 key 访问上游模型。
+
+        智谱(zhipu) API Key 格式为 {id}.{secret}，需要生成 JWT token。
+        """
         headers: Dict[str, str] = {"Content-Type": "application/json"}
+        # 优先级：模型自身 api_key > Provider api_key > 环境变量覆盖
+        # get_models() 已完成合并，selected["api_key"] 即为最终的上游 key
         api_key = selected.get("api_key", "")
+        api_type = selected.get("api_type", "openai")
         if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
+            if api_type == "zhipu":
+                # 智谱需要将 {id}.{secret} 格式的 key 转为 JWT token
+                from core.pricing_manager import ZhipuBalanceChecker
+                jwt_token = ZhipuBalanceChecker.generate_token(api_key)
+                if jwt_token:
+                    headers["Authorization"] = f"Bearer {jwt_token}"
+                else:
+                    # JWT 生成失败，回退到原始 key（可能认证失败）
+                    headers["Authorization"] = f"Bearer {api_key}"
+            else:
+                headers["Authorization"] = f"Bearer {api_key}"
         return headers
 
     def _log_fallback(
@@ -298,6 +589,7 @@ def create_app(predictor_instance=None) -> FastAPI:
         failed_models: List[str],
         error: str = "",
         prompt_preview: str = "",
+        extra: Optional[Dict[str, Any]] = None,
     ) -> None:
         """记录后备链切换事件到专用日志。"""
         fallback_logger.log_fallback(
@@ -307,6 +599,7 @@ def create_app(predictor_instance=None) -> FastAPI:
             failed_models=failed_models,
             error=error,
             prompt_preview=prompt_preview,
+            extra=extra,
         )
 
     async def _check_upstream_available(
@@ -315,14 +608,17 @@ def create_app(predictor_instance=None) -> FastAPI:
     ) -> tuple[bool, Dict[str, Any]]:
         """预检上游模型是否可用（用于流式模式的后备链判断）。
 
-        发送一个轻量的非流式请求，检查上游是否返回成功。
+        优化：发送一个极简请求（只含1条消息、max_tokens=1），
+        而非完整请求，大幅减少预检开销。
         返回 (is_available, error_info)。
         """
-        check_body = dict(body)
-        check_body["stream"] = False  # 强制非流式预检
-        # stream_options 必须与 stream=true 一起使用，预检时移除
-        check_body.pop("stream_options", None)
-        check_body["model"] = selected.get("upstream_model_name") or selected["name"]
+        # 构建极简预检请求体，只验证连通性和认证
+        check_body = {
+            "model": selected.get("upstream_model_name") or selected["name"],
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 1,
+            "stream": False,
+        }
         headers = _build_upstream_headers(selected)
         try:
             url = _build_upstream_url(selected)
@@ -330,21 +626,22 @@ def create_app(predictor_instance=None) -> FastAPI:
             return False, {"status_code": 400, "message": str(e)}
 
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                resp = await client.post(url, json=check_body, headers=headers)
-                if resp.status_code >= 400:
-                    error_msg = ""
-                    try:
-                        error_data = resp.json()
-                        error_msg = error_data.get("error", {}).get("message", str(error_data)) if isinstance(error_data, dict) else str(error_data)
-                    except Exception:
-                        error_msg = resp.text[:500]
-                    return False, {"status_code": resp.status_code, "message": error_msg}
-                return True, {}
+            client = await _get_http_client()
+            resp = await client.post(url, json=check_body, headers=headers, timeout=15.0)
+            if resp.status_code >= 400:
+                error_msg = ""
+                try:
+                    error_data = resp.json()
+                    error_msg = error_data.get("error", {}).get("message", str(error_data)) if isinstance(error_data, dict) else str(error_data)
+                except Exception:
+                    error_msg = resp.text[:500]
+                return False, {"status_code": resp.status_code, "message": error_msg}
+            return True, {}
         except Exception as exc:  # noqa: BLE001
             return False, {"status_code": 502, "message": str(exc)}
 
     async def _do_upstream(
+        request: Request,
         selected: Dict[str, Any],
         body: Dict[str, Any],
         request_id: str,
@@ -355,6 +652,8 @@ def create_app(predictor_instance=None) -> FastAPI:
         requested_model_name: str = "",
         route_source: Optional[str] = None,
         is_fallback_retry: bool = False,
+        route_chain: Optional[List[str]] = None,
+        content_types: Optional[List[str]] = None,
     ) -> StreamingResponse | JSONResponse:
         """执行上游请求，根据 stream 参数决定流式透传或非流式响应。
 
@@ -366,6 +665,30 @@ def create_app(predictor_instance=None) -> FastAPI:
           - auto 模式下客户端应看到实际路由到的模型名，而非 "auto"
           - 直连模式下客户端应看到自己请求的模型名
         """
+        # ===== 统一保险检查：确保模型未被禁用且在生效时间段内 =====
+        model_name = selected.get("name", "unknown")
+        if not selected.get("enabled", True):
+            is_auto = (not requested_model_name or requested_model_name == "auto")
+            if is_auto:
+                raise UpstreamError(
+                    model_name=model_name,
+                    status_code=403,
+                    message=f"Model {model_name} is disabled, skipping to fallback",
+                )
+            else:
+                raise OpenAIError(403, f"Model `{requested_model_name}` is disabled", "invalid_request_error")
+        if not pricing_manager.is_within_active_hours(selected.get("active_hours")):
+            is_auto = (not requested_model_name or requested_model_name == "auto")
+            if is_auto:
+                raise UpstreamError(
+                    model_name=model_name,
+                    status_code=403,
+                    message=f"Model {model_name} is outside active hours, skipping to fallback",
+                )
+            else:
+                raise OpenAIError(403, f"Model `{requested_model_name}` is not available at this time (outside active hours)", "invalid_request_error")
+        # ===== 保险检查结束 =====
+
         body = dict(body)
         # 发送给上游的模型名：优先 upstream_model_name
         upstream_model = selected.get("upstream_model_name") or selected["name"]
@@ -401,72 +724,79 @@ def create_app(predictor_instance=None) -> FastAPI:
             usage_info: Dict[str, Any] = {}
             success = True
             try:
-                async with httpx.AsyncClient(timeout=120.0) as client:
-                    resp = await client.post(url, json=body, headers=headers)
-                    if resp.status_code >= 400:
-                        success = False
-                        latency_ms = int((time.perf_counter() - t0) * 1000)
-                        asyncio.create_task(
-                            _after_call(
-                                request_id=request_id, prompt=prompt, diff=diff,
-                                est_tokens=est_tokens, selected=selected,
-                                latency_ms=latency_ms, success=False,
-                                collected_content="", usage_info={},
-                                task_type=task_type,
-                                route_source=effective_route_source,
-                                requested_model_name=requested_model_name,
-                            )
+                client = await _get_http_client()
+                resp = await client.post(url, json=body, headers=headers)
+                if resp.status_code >= 400:
+                    success = False
+                    latency_ms = int((time.perf_counter() - t0) * 1000)
+                    asyncio.create_task(
+                        _after_call(
+                            request=request,
+                            request_id=request_id, prompt=prompt, diff=diff,
+                            est_tokens=est_tokens, selected=selected,
+                            latency_ms=latency_ms, success=False,
+                            collected_content="", usage_info={},
+                            task_type=task_type,
+                            route_source=effective_route_source,
+                            requested_model_name=requested_model_name,
+                            route_chain=route_chain,
+                        content_types=content_types,
                         )
-                        # 抛出异常以触发后备链重试
-                        error_msg = ""
-                        try:
-                            error_data = resp.json()
-                            error_msg = error_data.get("error", {}).get("message", str(error_data)) if isinstance(error_data, dict) else str(error_data)
-                        except Exception:
-                            error_msg = resp.text[:500]
-                        raise UpstreamError(
-                            model_name=selected["name"],
-                            status_code=resp.status_code,
-                            message=error_msg,
+                    )
+                    # 抛出异常以触发后备链重试
+                    error_msg = ""
+                    try:
+                        error_data = resp.json()
+                        error_msg = error_data.get("error", {}).get("message", str(error_data)) if isinstance(error_data, dict) else str(error_data)
+                    except Exception:
+                        error_msg = resp.text[:500]
+                    raise UpstreamError(
+                        model_name=selected["name"],
+                        status_code=resp.status_code,
+                        message=error_msg,
+                    )
+                # 上游可能返回流式 SSE（即使我们请求非流式），需要兼容
+                content_type = resp.headers.get("content-type", "")
+                if "text/event-stream" in content_type:
+                    # 上游强制流式，收集完整响应后组装为非流式 JSON
+                    full_content, usage_info = _collect_sse_text(resp.text)
+                    collected_content = [full_content]
+                else:
+                    # 标准非流式 JSON 响应
+                    resp_data = resp.json()
+                    # 替换 model 字段为客户端应看到的模型名
+                    resp_data["model"] = display_model
+                    # 提取 content 和 usage
+                    choices = resp_data.get("choices", [])
+                    if choices:
+                        msg = choices[0].get("message", {})
+                        c = msg.get("content", "")
+                        if c:
+                            collected_content = [c]
+                    usage_info = resp_data.get("usage", {})
+                    latency_ms = int((time.perf_counter() - t0) * 1000)
+                    asyncio.create_task(
+                        _after_call(
+                            request=request,
+                            request_id=request_id, prompt=prompt, diff=diff,
+                            est_tokens=est_tokens, selected=selected,
+                            latency_ms=latency_ms, success=True,
+                            collected_content="".join(collected_content),
+                            usage_info=usage_info, task_type=task_type,
+                            route_source=effective_route_source,
+                            requested_model_name=requested_model_name,
+                            route_chain=route_chain,
+                        content_types=content_types,
                         )
-                    # 上游可能返回流式 SSE（即使我们请求非流式），需要兼容
-                    content_type = resp.headers.get("content-type", "")
-                    if "text/event-stream" in content_type:
-                        # 上游强制流式，收集完整响应后组装为非流式 JSON
-                        full_content, usage_info = _collect_sse_text(resp.text)
-                        collected_content = [full_content]
-                    else:
-                        # 标准非流式 JSON 响应
-                        resp_data = resp.json()
-                        # 替换 model 字段为客户端应看到的模型名
-                        resp_data["model"] = display_model
-                        # 提取 content 和 usage
-                        choices = resp_data.get("choices", [])
-                        if choices:
-                            msg = choices[0].get("message", {})
-                            c = msg.get("content", "")
-                            if c:
-                                collected_content = [c]
-                        usage_info = resp_data.get("usage", {})
-                        latency_ms = int((time.perf_counter() - t0) * 1000)
-                        asyncio.create_task(
-                            _after_call(
-                                request_id=request_id, prompt=prompt, diff=diff,
-                                est_tokens=est_tokens, selected=selected,
-                                latency_ms=latency_ms, success=True,
-                                collected_content="".join(collected_content),
-                                usage_info=usage_info, task_type=task_type,
-                                route_source=effective_route_source,
-                                requested_model_name=requested_model_name,
-                            )
-                        )
-                        return JSONResponse(content=resp_data)
+                    )
+                    return JSONResponse(content=resp_data)
             except UpstreamError:
                 raise  # 重新抛出，让外层处理后备链
             except Exception as exc:  # noqa: BLE001
                 latency_ms = int((time.perf_counter() - t0) * 1000)
                 asyncio.create_task(
                     _after_call(
+                        request=request,
                         request_id=request_id, prompt=prompt, diff=diff,
                         est_tokens=est_tokens, selected=selected,
                         latency_ms=latency_ms, success=False,
@@ -474,6 +804,8 @@ def create_app(predictor_instance=None) -> FastAPI:
                         task_type=task_type,
                         route_source=effective_route_source,
                         requested_model_name=requested_model_name,
+                        route_chain=route_chain,
+                    content_types=content_types,
                     )
                 )
                 # 抛出异常以触发后备链重试
@@ -487,6 +819,7 @@ def create_app(predictor_instance=None) -> FastAPI:
             latency_ms = int((time.perf_counter() - t0) * 1000)
             asyncio.create_task(
                 _after_call(
+                    request=request,
                     request_id=request_id, prompt=prompt, diff=diff,
                     est_tokens=est_tokens, selected=selected,
                     latency_ms=latency_ms, success=True,
@@ -494,6 +827,8 @@ def create_app(predictor_instance=None) -> FastAPI:
                     usage_info=usage_info, task_type=task_type,
                     route_source=effective_route_source,
                     requested_model_name=requested_model_name,
+                route_chain=route_chain,
+                content_types=content_types,
                 )
             )
             # 组装 OpenAI 兼容的非流式响应
@@ -509,81 +844,85 @@ def create_app(predictor_instance=None) -> FastAPI:
             usage_info: Dict[str, Any] = {}
             success = True
             try:
-                async with httpx.AsyncClient(timeout=120.0) as client:
-                    async with client.stream(
-                        "POST", url, json=body, headers=headers
-                    ) as resp:
-                        if resp.status_code >= 400:
-                            success = False
-                            error_body = await resp.aread()
-                            latency_ms = int((time.perf_counter() - t0) * 1000)
-                            asyncio.create_task(
-                                _after_call(
-                                    request_id=request_id, prompt=prompt, diff=diff,
-                                    est_tokens=est_tokens, selected=selected,
-                                    latency_ms=latency_ms, success=False,
-                                    collected_content="", usage_info={},
-                                    task_type=task_type,
-                                    route_source=effective_route_source,
-                                    requested_model_name=requested_model_name,
-                                )
+                client = await _get_http_client()
+                async with client.stream(
+                    "POST", url, json=body, headers=headers
+                ) as resp:
+                    if resp.status_code >= 400:
+                        success = False
+                        error_body = await resp.aread()
+                        latency_ms = int((time.perf_counter() - t0) * 1000)
+                        asyncio.create_task(
+                            _after_call(
+                                request=request,
+                                request_id=request_id, prompt=prompt, diff=diff,
+                                est_tokens=est_tokens, selected=selected,
+                                latency_ms=latency_ms, success=False,
+                                collected_content="", usage_info={},
+                                task_type=task_type,
+                                route_source=effective_route_source,
+                                requested_model_name=requested_model_name,
+                                route_chain=route_chain,
+                            content_types=content_types,
                             )
-                            error_msg = ""
-                            try:
-                                error_text = error_body.decode("utf-8", errors="ignore")
-                                import json as _json
-                                try:
-                                    error_data = _json.loads(error_text)
-                                    error_msg = error_data.get("error", {}).get("message", str(error_data)) if isinstance(error_data, dict) else str(error_data)
-                                except Exception:
-                                    error_msg = error_text[:500]
-                            except Exception:
-                                error_msg = "upstream error"
+                        )
+                        error_msg = ""
+                        try:
+                            error_text = error_body.decode("utf-8", errors="ignore")
                             import json as _json
-                            error_resp = {"error": {"message": error_msg, "type": "upstream_error", "param": None, "code": None}}
-                            yield f"data: {_json.dumps(error_resp)}\n\n".encode("utf-8")
-                            yield b"data: [DONE]\n\n"
-                            return
-                        async for line in resp.aiter_lines():
-                            # 按行处理 SSE 数据，替换 model 字段并收集 content
-                            if not line.strip():
-                                # 空行（SSE 分隔符），直接透传
-                                yield b"\n"
+                            try:
+                                error_data = _json.loads(error_text)
+                                error_msg = error_data.get("error", {}).get("message", str(error_data)) if isinstance(error_data, dict) else str(error_data)
+                            except Exception:
+                                error_msg = error_text[:500]
+                        except Exception:
+                            error_msg = "upstream error"
+                        import json as _json
+                        error_resp = {"error": {"message": error_msg, "type": "upstream_error", "param": None, "code": None}}
+                        yield f"data: {_json.dumps(error_resp)}\n\n".encode("utf-8")
+                        yield b"data: [DONE]\n\n"
+                        return
+                    async for line in resp.aiter_lines():
+                        # 按行处理 SSE 数据，替换 model 字段并收集 content
+                        if not line.strip():
+                            # 空行（SSE 分隔符），直接透传
+                            yield b"\n"
+                            continue
+                        if line.startswith("data: "):
+                            import json as _json
+                            payload = line[6:].strip()
+                            if payload == "[DONE]":
+                                yield b"data: [DONE]\n\n"
                                 continue
-                            if line.startswith("data: "):
-                                import json as _json
-                                payload = line[6:].strip()
-                                if payload == "[DONE]":
-                                    yield b"data: [DONE]\n\n"
-                                    continue
-                                try:
-                                    data = _json.loads(payload)
-                                    # 替换 model 字段为客户端应看到的模型名
-                                    if "model" in data:
-                                        data["model"] = display_model
-                                    # 收集 content 用于难度评估
-                                    delta = (
-                                        data.get("choices", [{}])[0]
-                                        .get("delta", {})
-                                        .get("content", "")
-                                    )
-                                    if delta:
-                                        collected_content.append(delta)
-                                    if "usage" in data:
-                                        usage_info.update(data["usage"])
-                                    # 重新编码为 SSE 格式
-                                    modified_line = f"data: {_json.dumps(data, ensure_ascii=False)}\n\n"
-                                    yield modified_line.encode("utf-8")
-                                    continue
-                                except Exception:  # noqa: BLE001
-                                    pass
-                            # 非 SSE 行或 JSON 解析失败，原样透传
-                            yield (line + "\n").encode("utf-8")
+                            try:
+                                data = _json.loads(payload)
+                                # 替换 model 字段为客户端应看到的模型名
+                                if "model" in data:
+                                    data["model"] = display_model
+                                # 收集 content 用于难度评估
+                                delta = (
+                                    data.get("choices", [{}])[0]
+                                    .get("delta", {})
+                                    .get("content", "")
+                                )
+                                if delta:
+                                    collected_content.append(delta)
+                                if "usage" in data:
+                                    usage_info.update(data["usage"])
+                                # 重新编码为 SSE 格式
+                                modified_line = f"data: {_json.dumps(data, ensure_ascii=False)}\n\n"
+                                yield modified_line.encode("utf-8")
+                                continue
+                            except Exception:  # noqa: BLE001
+                                pass
+                        # 非 SSE 行或 JSON 解析失败，原样透传
+                        yield (line + "\n").encode("utf-8")
             except Exception as exc:  # noqa: BLE001
                 success = False
                 latency_ms = int((time.perf_counter() - t0) * 1000)
                 asyncio.create_task(
                     _after_call(
+                        request=request,
                         request_id=request_id, prompt=prompt, diff=diff,
                         est_tokens=est_tokens, selected=selected,
                         latency_ms=latency_ms, success=False,
@@ -591,6 +930,8 @@ def create_app(predictor_instance=None) -> FastAPI:
                         task_type=task_type,
                         route_source=effective_route_source,
                         requested_model_name=requested_model_name,
+                        route_chain=route_chain,
+                    content_types=content_types,
                     )
                 )
                 import json as _json
@@ -605,6 +946,7 @@ def create_app(predictor_instance=None) -> FastAPI:
                     latency_ms = int((time.perf_counter() - t0) * 1000)
                     asyncio.create_task(
                         _after_call(
+                            request=request,
                             request_id=request_id,
                             prompt=prompt,
                             diff=diff,
@@ -617,6 +959,8 @@ def create_app(predictor_instance=None) -> FastAPI:
                             task_type=task_type,
                             route_source=effective_route_source,
                             requested_model_name=requested_model_name,
+                            route_chain=route_chain,
+                        content_types=content_types,
                         )
                     )
 
@@ -625,6 +969,7 @@ def create_app(predictor_instance=None) -> FastAPI:
         )
 
     async def _after_call(
+        request: Request,
         request_id: str,
         prompt: str,
         diff: int,
@@ -637,6 +982,8 @@ def create_app(predictor_instance=None) -> FastAPI:
         task_type: Optional[str] = None,
         route_source: Optional[str] = None,
         requested_model_name: str = "",
+        route_chain: Optional[List[str]] = None,
+        content_types: Optional[List[str]] = None,
     ) -> None:
         """请求结束后的异步处理：记录日志、训练、扣账。"""
         # 真实 Token 数
@@ -676,6 +1023,8 @@ def create_app(predictor_instance=None) -> FastAPI:
             requested_model=requested_model_name or None,
             prompt_tokens=actual_in_tokens,
             completion_tokens=actual_out_tokens,
+            route_chain=",".join(route_chain) if route_chain else None,
+            content_types=",".join(content_types) if content_types else None,
         )
         # 本地扣账
         if cost > 0:
@@ -685,12 +1034,41 @@ def create_app(predictor_instance=None) -> FastAPI:
         # 自适应学习：从成功请求中学习关键词
         if task_type and success:
             task_type_detector.learn_keywords(task_type, prompt, success)
+        # 更新 request.state 供 API 日志中间件读取
+        try:
+            request.state._api_prompt_tokens = actual_in_tokens
+            request.state._api_completion_tokens = actual_out_tokens
+            request.state._api_cost = cost
+            request.state._api_cost_currency = target_currency
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------ #
     # 核心代理接口
     # ------------------------------------------------------------------ #
     @app.post("/v1/chat/completions")
     async def proxy(request: Request, _auth=Depends(check_api_key)):
+        # 并发控制：使用信号量限制同时处理的上游请求数
+        if _concurrency_semaphore is None:
+            raise OpenAIError(503, "Service not ready", "server_error")
+        # 非阻塞尝试获取信号量，失败则返回 429
+        acquired = False
+        try:
+            acquired = _concurrency_semaphore._value > 0
+            if not acquired:
+                raise OpenAIError(429, "Too many concurrent requests, please retry later", "rate_limit_error")
+            await asyncio.wait_for(_concurrency_semaphore.acquire(), timeout=0.1)
+            acquired = True
+        except asyncio.TimeoutError:
+            raise OpenAIError(429, "Too many concurrent requests, please retry later", "rate_limit_error")
+        try:
+            return await _proxy_impl(request)
+        finally:
+            if acquired:
+                _concurrency_semaphore.release()
+
+    async def _proxy_impl(request: Request) -> StreamingResponse | JSONResponse:
+        """代理请求的核心实现（从 proxy 中提取，便于并发控制包装）。"""
         body = await request.json()
 
         # 模型名映射：将请求中的模型名映射为实际模型名
@@ -701,21 +1079,49 @@ def create_app(predictor_instance=None) -> FastAPI:
             body["model"] = resolved_model
 
         prompt = _extract_prompt(body)
+        content_types = _detect_content_types(body)
+        has_multimodal = any(t != "text" for t in content_types)
         request_id = str(uuid.uuid4())
+        # 设置 request.state 供 API 日志中间件读取
+        request.state._api_request_id = request_id
+        request.state._api_requested_model = requested_model or "auto"
+        request.state._api_routed_model = None
+        request.state._api_route_source = None
+        request.state._api_prompt_tokens = 0
+        request.state._api_completion_tokens = 0
+        request.state._api_cost = 0.0
+        request.state._api_cost_currency = config.currency
+        request.state._api_prompt_preview = prompt[:200] if prompt else None
 
         # 1. 缓存命中检查（关键词定向优先级高于缓存）
-        prompt_hash = _hash_prompt(prompt)
+        # 多模态请求不使用缓存（因为 prompt hash 不包含非文本内容）
+        prompt_hash = _hash_prompt(prompt) if not has_multimodal else ""
         # 先检测关键词——如果用户明确指定了模型，忽略缓存
         keyword_model_early = detect_model_keyword(prompt, pricing_manager.get_available_models())
         if not keyword_model_early:
-            cached_model = router.get_cached_route(prompt_hash)
+            cached_model = router.get_cached_route(prompt_hash) if prompt_hash else None
+            if cached_model:
+                # 检查缓存命中的模型是否仍在生效时间段内
+                if not pricing_manager.is_within_active_hours(cached_model.get("active_hours")):
+                    cached_model = None
+                elif not cached_model.get("enabled", True):
+                    cached_model = None
+                # 检查缓存命中的模型是否支持请求的内容类型
+                elif has_multimodal and not router._supports_content_types(cached_model, content_types):
+                    cached_model = None
             if cached_model:
                 task_type = detect_task_type(prompt)
-                return await _do_upstream(
-                    cached_model, body, request_id, prompt, 3, 500,
-                    task_type=task_type, requested_model_name=requested_model,
-                    route_source="cache",
-                )
+                try:
+                    return await _do_upstream(
+                        request, cached_model, body, request_id, prompt, 3, 500,
+                        task_type=task_type, requested_model_name=requested_model,
+                        route_source="cache",
+                        route_chain=[cached_model["name"]],
+                    content_types=content_types,
+                    )
+                except UpstreamError:
+                    # 缓存命中的模型被保险检查拒绝，继续走正常路由
+                    pass
 
         # 2. 同步拦截预测
         diff, est_tok = app.state.predictor.predict(prompt)
@@ -745,10 +1151,17 @@ def create_app(predictor_instance=None) -> FastAPI:
         if keyword_model:
             selected = config.get_model(keyword_model)
             if selected:
-                route_source = "keyword"
+                # 检查模型是否在生效时间段内
+                if not pricing_manager.is_within_active_hours(selected.get("active_hours")):
+                    selected = None
+                # 检查模型是否支持请求的内容类型
+                elif has_multimodal and not app.state.router._supports_content_types(selected, content_types):
+                    selected = None
+                else:
+                    route_source = "keyword"
         if not selected and (is_auto_route or requested_model_name == "auto"):
             # 智能路由模式（双机制：预测推荐 + 评分）
-            selected = app.state.router.select_model(diff, est_tok, est_tok, task_type=task_type, predictor_recommendation=predictor_rec)
+            selected = app.state.router.select_model(diff, est_tok, est_tok, task_type=task_type, predictor_recommendation=predictor_rec, content_types=content_types)
             route_source = "auto"
         elif not selected and requested_model_name:
             selected = config.get_model(requested_model_name)
@@ -758,57 +1171,88 @@ def create_app(predictor_instance=None) -> FastAPI:
                     f"The model `{requested_model_name}` does not exist",
                     "invalid_request_error",
                 )
+            # 检查模型是否在生效时间段内
+            if not pricing_manager.is_within_active_hours(selected.get("active_hours")):
+                raise OpenAIError(
+                    403,
+                    f"The model `{requested_model_name}` is not available at this time (outside active hours)",
+                    "invalid_request_error",
+                )
+            # 检查模型是否支持请求的内容类型
+            if has_multimodal and not app.state.router._supports_content_types(selected, content_types):
+                raise OpenAIError(
+                    400,
+                    f"The model `{requested_model_name}` does not support the requested content types: {', '.join(t for t in content_types if t != 'text')}. "
+                    f"Please use a model that supports multimodal input.",
+                    "invalid_request_error",
+                )
             route_source = "direct"
 
         if not selected:
-            selected = app.state.router.select_model(diff, est_tok, est_tok, task_type=task_type, predictor_recommendation=predictor_rec)
+            selected = app.state.router.select_model(diff, est_tok, est_tok, task_type=task_type, predictor_recommendation=predictor_rec, content_types=content_types)
             route_source = "auto"
         if not selected:
             # 使用 fallback 模型
             selected = config.get_fallback_model()
-            route_source = "fallback"
+            # 检查 fallback 模型是否在生效时间段内
+            if selected and not pricing_manager.is_within_active_hours(selected.get("active_hours")):
+                selected = None
+            if selected:
+                route_source = "fallback"
             if not selected:
-                raise OpenAIError(503, "No model available", "server_error")
+                raise OpenAIError(503, "No model available (all models are outside their active hours or disabled)", "server_error")
+
+        # 记录路由信息到 request.state（供 API 日志中间件读取）
+        request.state._api_routed_model = selected["name"]
+        request.state._api_route_source = route_source
 
         # 5. 代理请求（含后备链重试）
         # 非流式和流式请求都支持后备链重试
         is_stream = body.get("stream", False)
 
+        # 预先计算完整的后备链（严格匹配 → 宽松匹配 → 兜底），避免重复计算权重
+        strict_chain = app.state.router.select_fallback_chain(
+            diff, est_tok, est_tok,
+            failed_models=[selected["name"]],
+            task_type=task_type,
+            strict_capability=True,
+            content_types=content_types,
+        )
+        loose_chain = app.state.router.select_fallback_chain(
+            diff, est_tok, est_tok,
+            failed_models=[selected["name"]],
+            task_type=task_type,
+            strict_capability=False,
+            content_types=content_types,
+        )
+        # 宽松链中去除严格链已有的模型（避免重复）
+        strict_names = {m["name"] for m in strict_chain}
+        loose_only = [m for m in loose_chain if m["name"] not in strict_names]
+        # 兜底模型
+        fb_model = config.get_fallback_model()
+        fb_list = []
+        if fb_model and fb_model["name"] != selected["name"] and fb_model["name"] not in strict_names and pricing_manager.is_within_active_hours(fb_model.get("active_hours")):
+            fb_list = [fb_model]
+        # 完整后备链：严格匹配 → 宽松降级 → 兜底
+        full_fallback_chain = strict_chain + loose_only + fb_list
+        # 记录路由链路信息
+        route_chain_info = [selected["name"]] + [m["name"] for m in full_fallback_chain]
+
         # 流式模式：先预检上游连接，失败则触发后备链
         if is_stream:
             failed_models_stream: List[str] = []
             last_error_stream: Optional[UpstreamError] = None
-            max_retries_stream = len(config.get_models())
 
-            for attempt in range(max_retries_stream + 1):
+            for attempt in range(len(full_fallback_chain) + 1):
                 if attempt == 0:
                     current_model = selected
                     current_route_source = route_source
                     is_retry = False
                 else:
-                    # 先尝试严格匹配的后备链，再尝试宽松匹配（允许降级）
-                    fallback_chain = app.state.router.select_fallback_chain(
-                        diff, est_tok, est_tok,
-                        failed_models=failed_models_stream,
-                        task_type=task_type,
-                        strict_capability=True,
-                    )
-                    if not fallback_chain:
-                        # 严格匹配无结果，放宽能力要求（兜底）
-                        fallback_chain = app.state.router.select_fallback_chain(
-                            diff, est_tok, est_tok,
-                            failed_models=failed_models_stream,
-                            task_type=task_type,
-                            strict_capability=False,
-                        )
-                    if not fallback_chain:
-                        # 最终兜底：使用 fallback_model
-                        fb = config.get_fallback_model()
-                        if fb and fb["name"] not in failed_models_stream:
-                            fallback_chain = [fb]
-                    if not fallback_chain:
+                    # 从预计算的后备链中取下一个模型
+                    if attempt - 1 >= len(full_fallback_chain):
                         break
-                    current_model = fallback_chain[0]
+                    current_model = full_fallback_chain[attempt - 1]
                     current_route_source = "fallback"
                     is_retry = True
                     _log_fallback(
@@ -818,6 +1262,7 @@ def create_app(predictor_instance=None) -> FastAPI:
                         failed_models=failed_models_stream,
                         error=last_error_stream.message if last_error_stream else "",
                         prompt_preview=prompt[:100],
+                        extra={"route_chain": route_chain_info},
                     )
 
                 # 预检：先发一个轻量请求检查上游是否可用
@@ -826,12 +1271,22 @@ def create_app(predictor_instance=None) -> FastAPI:
                 )
                 if upstream_ok:
                     # 上游可用，开始流式传输
-                    return await _do_upstream(
-                        current_model, body, request_id, prompt, diff, est_tok,
-                        task_type=task_type, requested_model_name=requested_model,
-                        route_source=current_route_source,
-                        is_fallback_retry=is_retry,
-                    )
+                    try:
+                        return await _do_upstream(
+                            request,
+                            current_model, body, request_id, prompt, diff, est_tok,
+                            task_type=task_type, requested_model_name=requested_model,
+                            route_source=current_route_source,
+                            is_fallback_retry=is_retry,
+                            route_chain=route_chain_info,
+                        content_types=content_types,
+                        )
+                    except UpstreamError as e:
+                        # 保险检查拒绝的模型也触发后备链重试
+                        failed_models_stream.append(e.model_name)
+                        last_error_stream = e
+                        app.state.router._degrade_reliability(e.model_name)
+                        continue
                 else:
                     # 上游不可用，记录失败并尝试下一个模型
                     failed_models_stream.append(current_model["name"])
@@ -859,39 +1314,18 @@ def create_app(predictor_instance=None) -> FastAPI:
         # 非流式模式：实现后备链重试
         failed_models: List[str] = []
         last_error: Optional[UpstreamError] = None
-        max_retries = len(config.get_models())  # 最多尝试所有模型
 
-        for attempt in range(max_retries + 1):
+        for attempt in range(len(full_fallback_chain) + 1):
             if attempt == 0:
                 # 首次尝试：使用选中的模型
                 current_model = selected
                 current_route_source = route_source
                 is_retry = False
             else:
-                # 后备重试：从后备链中获取下一个模型
-                # 先尝试严格匹配，再尝试宽松匹配（允许降级）
-                fallback_chain = app.state.router.select_fallback_chain(
-                    diff, est_tok, est_tok,
-                    failed_models=failed_models,
-                    task_type=task_type,
-                    strict_capability=True,
-                )
-                if not fallback_chain:
-                    # 严格匹配无结果，放宽能力要求（兜底）
-                    fallback_chain = app.state.router.select_fallback_chain(
-                        diff, est_tok, est_tok,
-                        failed_models=failed_models,
-                        task_type=task_type,
-                        strict_capability=False,
-                    )
-                if not fallback_chain:
-                    # 最终兜底：使用 fallback_model
-                    fb = config.get_fallback_model()
-                    if fb and fb["name"] not in failed_models:
-                        fallback_chain = [fb]
-                if not fallback_chain:
-                    break  # 没有更多后备模型
-                current_model = fallback_chain[0]
+                # 从预计算的后备链中取下一个模型
+                if attempt - 1 >= len(full_fallback_chain):
+                    break
+                current_model = full_fallback_chain[attempt - 1]
                 current_route_source = "fallback"
                 is_retry = True
                 # 记录后备链日志
@@ -902,14 +1336,18 @@ def create_app(predictor_instance=None) -> FastAPI:
                     failed_models=failed_models,
                     error=last_error.message if last_error else "",
                     prompt_preview=prompt[:100],
+                    extra={"route_chain": route_chain_info},
                 )
 
             try:
                 return await _do_upstream(
+                    request,
                     current_model, body, request_id, prompt, diff, est_tok,
                     task_type=task_type, requested_model_name=requested_model,
                     route_source=current_route_source,
                     is_fallback_retry=is_retry,
+                    route_chain=route_chain_info,
+                content_types=content_types,
                 )
             except UpstreamError as e:
                 failed_models.append(e.model_name)
@@ -939,8 +1377,9 @@ def create_app(predictor_instance=None) -> FastAPI:
         model="auto" 表示智能路由模式，由系统自动选择最优模型。
         """
         models = config.get_models()
-        # 只暴露启用的模型
+        # 只暴露启用的且在生效时间段内的模型
         models = [m for m in models if m.get("enabled", True)]
+        models = [m for m in models if pricing_manager.is_within_active_hours(m.get("active_hours"))]
         aliases = config.model_aliases
         now = int(time.time())
         data = [
@@ -949,6 +1388,7 @@ def create_app(predictor_instance=None) -> FastAPI:
                 "object": "model",
                 "created": now,
                 "owned_by": m.get("api_type", "unknown"),
+                "modalities": m.get("modalities", ["text"]),
             }
             for m in models
         ]
@@ -999,6 +1439,7 @@ def create_app(predictor_instance=None) -> FastAPI:
         models = config.get_models()
         target_currency = config.currency
         result = []
+        loop = asyncio.get_event_loop()
         for m in models:
             if not m.get("enabled", True):
                 continue
@@ -1010,7 +1451,7 @@ def create_app(predictor_instance=None) -> FastAPI:
                 balance = pricing_manager._get_cached_balance(m)
                 source = "cached"
             else:
-                balance = pricing_manager._get_balance(m)
+                balance = await loop.run_in_executor(None, pricing_manager._get_balance, m)
                 source = "api"
             # 余额货币转换
             balance_currency = m.get("balance_currency", m.get("price_currency", "USD"))
@@ -1044,7 +1485,8 @@ def create_app(predictor_instance=None) -> FastAPI:
             balance = pricing_manager._get_cached_balance(m)
             source = "cached"
         else:
-            balance = pricing_manager._get_balance(m)
+            loop = asyncio.get_event_loop()
+            balance = await loop.run_in_executor(None, pricing_manager._get_balance, m)
             source = "api"
         balance_currency = m.get("balance_currency", m.get("price_currency", "USD"))
         if balance_currency != target_currency and balance is not None:
@@ -1136,6 +1578,11 @@ def create_app(predictor_instance=None) -> FastAPI:
     @app.get("/admin/api/dashboard")
     async def api_dashboard(period: str = "today", _admin=Depends(require_admin)):
         """仪表盘统计。period: today/week/month/all"""
+        # 缓存10秒，避免频繁刷新时重复查询数据库
+        cache_key = f"dashboard:{period}"
+        cached = _cache_get(cache_key)
+        if cached is not None:
+            return cached
         now = time.time()
         if period == "today":
             since = now - 86400
@@ -1163,37 +1610,70 @@ def create_app(predictor_instance=None) -> FastAPI:
                 m["total_cost"] = round(float(exchange_rate_manager.convert(
                     m["total_cost"], m["cost_currency"], target_currency)), 6)
                 m["cost_currency"] = target_currency
+        _cache_set(cache_key, data, ttl=10.0)
         return data
 
     @app.get("/admin/api/models")
     async def api_models(_admin=Depends(require_admin)):
-        """管理面板模型列表：显示所有模型（包括禁用的），附带余额和价格。"""
+        """管理面板模型列表：显示所有模型（包括禁用的），附带余额和价格。
+
+        性能优化：余额和价格查询仅使用缓存/配置值，不触发实时网络请求，
+        避免同步 HTTP 请求阻塞事件循环导致面板白屏。
+        实时余额由后台定时任务或 /v1/balance 接口单独更新。
+        """
         models = config.get_models()
         target_currency = config.currency
+        # 批量获取所有模型指标（避免逐个查询数据库）
+        try:
+            all_metrics = {m["model_name"]: m for m in db.get_all_metrics()}
+        except Exception:
+            all_metrics = {}
         for m in models:
-            # 余额处理（与 pricing_manager 相同逻辑）
-            if m.get("balance_manual") is not None:
-                m["balance"] = m["balance_manual"]
-            elif m.get("balance_frozen"):
-                m["balance"] = pricing_manager._get_cached_balance(m)
+            # 余额处理：优先使用手动设定值，其次内存缓存，最后批量指标
+            bm = m.get("balance_manual")
+            if bm is not None and bm != "":
+                m["balance"] = bm
             else:
-                m["balance"] = pricing_manager._get_balance(m)
+                # 仅查内存缓存（不查数据库，避免 77 次 DB 查询）
+                with pricing_manager._lock:
+                    cached = pricing_manager._balance_cache.get(m.get("name", ""))
+                    m["balance"] = cached[1] if cached else None
+                # 内存缓存未命中时，从批量指标获取
+                if m.get("balance") is None:
+                    metrics = all_metrics.get(m.get("name", ""))
+                    if metrics and metrics.get("last_balance") is not None:
+                        m["balance"] = metrics["last_balance"]
+
+            # 价格获取：仅使用配置中的值，不执行价格脚本
+            # （价格脚本可能包含同步网络请求，会阻塞事件循环）
+            price_input = m.get("price_input", 0)
+            price_output = m.get("price_output", 0)
+            model_currency = m.get("price_currency", target_currency)
+            model_unit = m.get("price_unit", "1M")
+
             # 价格货币转换
-            model_currency = m.get("price_currency", "USD")
             if model_currency != target_currency:
                 m["price_input_display"] = round(
-                    exchange_rate_manager.convert(m.get("price_input", 0), model_currency, target_currency), 8)
+                    exchange_rate_manager.convert(price_input, model_currency, target_currency), 8)
                 m["price_output_display"] = round(
-                    exchange_rate_manager.convert(m.get("price_output", 0), model_currency, target_currency), 8)
+                    exchange_rate_manager.convert(price_output, model_currency, target_currency), 8)
                 m["price_currency_display"] = target_currency
             else:
-                m["price_input_display"] = m.get("price_input", 0)
-                m["price_output_display"] = m.get("price_output", 0)
+                m["price_input_display"] = price_input
+                m["price_output_display"] = price_output
                 m["price_currency_display"] = target_currency
+            m["price_unit_display"] = model_unit
+
             # 脱敏 API Key
             if m.get("api_key"):
                 key = m["api_key"]
                 m["api_key"] = key[:8] + "***" if len(key) > 8 else "***"
+            # 脱敏 Provider 中的 API Key（防止泄露）
+            if m.get("_provider") and m["_provider"].get("api_key"):
+                pkey = m["_provider"]["api_key"]
+                m["_provider"]["api_key"] = pkey[:8] + "***" if len(pkey) > 8 else "***"
+            # 判断当前是否在生效时间段内
+            m["is_active_now"] = pricing_manager.is_within_active_hours(m.get("active_hours"))
         return {"models": models}
 
     @app.post("/admin/api/models")
@@ -1206,10 +1686,18 @@ def create_app(predictor_instance=None) -> FastAPI:
         for m in models_data:
             key = m.get("api_key", "")
             if key.endswith("***"):
-                # 前端传回的脱敏 key，恢复原值
-                original = existing_keys.get(m["name"], "")
-                if original:
-                    m["api_key"] = original
+                # 前端传回的脱敏 key
+                if m.get("_api_key_inherited"):
+                    # 继承自提供方的 key，不写入模型配置（让运行时从 provider 继承）
+                    m.pop("api_key", None)
+                else:
+                    # 模型自有的 key，恢复原值
+                    original = existing_keys.get(m["name"], "")
+                    if original:
+                        m["api_key"] = original
+                    else:
+                        # 原始配置中也没有 key，说明是继承的，移除
+                        m.pop("api_key", None)
             # 处理 capability_manual：如果自动模式，删除 capability 让后端自动计算
             if not m.get("capability_manual", False):
                 m.pop("capability", None)
@@ -1219,12 +1707,388 @@ def create_app(predictor_instance=None) -> FastAPI:
             m.pop("price_input_display", None)
             m.pop("price_output_display", None)
             m.pop("price_currency_display", None)
+            m.pop("is_active_now", None)
+            m.pop("active_hours_list", None)
+            m.pop("_provider", None)
+            m.pop("_api_key_inherited", None)
+            m.pop("owned_by", None)
         config.set("models", models_data)
         try:
             config.save()
         except Exception:
             pass
         return {"status": "ok"}
+
+    # ------------------------------------------------------------------ #
+    # 模型批量操作 API（必须在 {model_name:path} 路由之前注册）
+    # ------------------------------------------------------------------ #
+    async def _detect_single_modality(model_cfg: Dict[str, Any]) -> Dict[str, Any]:
+        """检测单个模型的模态支持（内部函数，供并发调用）。"""
+        model_name = model_cfg.get("name", "unknown")
+        detected = {"text"}
+        method = "probe"
+
+        base_url = model_cfg.get("base_url", "").rstrip("/")
+        api_key = model_cfg.get("api_key", "")
+        api_type = model_cfg.get("api_type", "openai")
+        upstream_model = model_cfg.get("upstream_model_name") or model_name
+
+        if not base_url or not base_url.startswith("http"):
+            return {"modalities": ["text"], "method": "skip", "detail": "缺少或无效 base_url"}
+        if api_key and api_key.startswith("YOUR_"):
+            return {"modalities": ["text"], "method": "skip", "detail": "API Key 为占位符"}
+
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            if api_type == "zhipu":
+                from core.pricing_manager import ZhipuBalanceChecker
+                jwt_token = ZhipuBalanceChecker.generate_token(api_key)
+                headers["Authorization"] = f"Bearer {jwt_token}" if jwt_token else f"Bearer {api_key}"
+            else:
+                headers["Authorization"] = f"Bearer {api_key}"
+
+        client = await _get_http_client()
+
+        try:
+            models_url = f"{base_url}/models/{upstream_model}"
+            resp = await client.get(models_url, headers=headers, timeout=8.0)
+            if resp.status_code == 200:
+                model_info = resp.json()
+                model_modalities = model_info.get("modalities") or model_info.get("capabilities", {}).get("modalities")
+                if model_modalities and isinstance(model_modalities, list):
+                    for mod in model_modalities:
+                        mod_lower = mod.lower() if isinstance(mod, str) else str(mod).lower()
+                        if mod_lower in ("text", "image", "audio", "video", "file"):
+                            detected.add(mod_lower)
+                        elif "image" in mod_lower or "vision" in mod_lower:
+                            detected.add("image")
+                        elif "audio" in mod_lower or "speech" in mod_lower:
+                            detected.add("audio")
+                        elif "video" in mod_lower:
+                            detected.add("video")
+                    method = "query"
+        except Exception:
+            pass
+
+        # 名称推断：基于模型名称关键词推断模态支持
+        if method == "probe":
+            name_lower = upstream_model.lower()
+            # 多模态模型名称模式
+            _NAME_MODALITY_HINTS = {
+                "image": ["vision", "gpt-4o", "gpt-4-turbo", "gpt-4v", "claude-3", "gemini", "qwen-vl",
+                          "qwen2-vl", "glm-4v", "step-1v", "yi-vision", "internvl", "cogvlm",
+                          "llava", "minicpm-v", "pixtral"],
+                "audio": ["whisper", "tts", "speech", "audio", "gpt-4o-audio", "glm-4-voice",
+                          "qwen-audio", "qwen2-audio"],
+                "video": ["video", "gpt-4o-video"],
+            }
+            for modality, keywords in _NAME_MODALITY_HINTS.items():
+                for kw in keywords:
+                    if kw in name_lower:
+                        detected.add(modality)
+                        method = "name_infer"
+                        break
+            # 名称推断后仍可继续探测以补充更多模态
+
+        if method == "probe" or method == "name_infer":
+            chat_url = f"{base_url}/chat/completions"
+
+            async def probe_image():
+                try:
+                    image_body = {
+                        "model": upstream_model,
+                        "messages": [{"role": "user", "content": [
+                            {"type": "text", "text": "Describe"},
+                            {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="}}
+                        ]}],
+                        "max_tokens": 1, "stream": False,
+                    }
+                    resp = await client.post(chat_url, json=image_body, headers=headers, timeout=10.0)
+                    if resp.status_code < 400:
+                        detected.add("image")
+                except Exception:
+                    pass
+
+            async def probe_audio():
+                try:
+                    audio_body = {
+                        "model": upstream_model,
+                        "messages": [{"role": "user", "content": [
+                            {"type": "text", "text": "Listen"},
+                            {"type": "input_audio", "input_audio": {"data": "dGVzdA==", "format": "wav"}}
+                        ]}],
+                        "max_tokens": 1, "stream": False,
+                    }
+                    resp = await client.post(chat_url, json=audio_body, headers=headers, timeout=10.0)
+                    if resp.status_code < 400:
+                        detected.add("audio")
+                except Exception:
+                    pass
+
+            await asyncio.gather(probe_image(), probe_audio())
+
+        final_modalities = sorted(detected, key=lambda x: ["text", "image", "audio", "video", "file"].index(x) if x in ["text", "image", "audio", "video", "file"] else 99)
+        return {"modalities": final_modalities, "method": method}
+
+    async def _detect_single_balance(model_cfg: Dict[str, Any]) -> Dict[str, Any]:
+        """检测单个模型余额。"""
+        model_name = model_cfg.get("name", "unknown")
+        try:
+            loop = asyncio.get_event_loop()
+            balance = await loop.run_in_executor(None, pricing_manager.refresh_balance, model_name)
+            return {"balance": balance, "method": "query"}
+        except Exception as e:
+            return {"balance": None, "method": "error", "detail": str(e)[:100]}
+
+    async def _detect_single_price(model_cfg: Dict[str, Any]) -> Dict[str, Any]:
+        """检测单个模型价格。"""
+        model_name = model_cfg.get("name", "unknown")
+        try:
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, pricing_manager.get_model_price_from_script, model_cfg)
+            if result:
+                return {"price_input": result.get("price_input"), "price_output": result.get("price_output"), "method": "query"}
+            return {"method": "skip", "detail": "无价格脚本"}
+        except Exception as e:
+            return {"method": "error", "detail": str(e)[:100]}
+
+    @app.post("/admin/api/models/detect-modalities")
+    async def api_detect_modalities(request: Request, _admin=Depends(require_admin)):
+        """自动检测模型支持的模态（并发执行）。
+
+        检测结果默认写入 pending_modalities，需确认后才生效。
+        save=True 时写入 pending_modalities 而非直接写入 modalities。
+        """
+        body = await request.json()
+        model_names = body.get("model_names", [])
+        save = body.get("save", False)
+
+        if not model_names:
+            raise HTTPException(status_code=400, detail="model_names 不能为空")
+
+        models = config.get_models()
+        raw_models = config.get("models", [])
+
+        model_cfg_map = {}
+        for m in models:
+            name = m.get("name")
+            if name and name in model_names:
+                model_cfg_map[name] = m
+
+        sem = asyncio.Semaphore(10)
+
+        async def detect_with_sem(name):
+            cfg = model_cfg_map.get(name)
+            if not cfg:
+                return name, {"modalities": ["text"], "method": "not_found", "detail": "模型未找到"}
+            async with sem:
+                result = await _detect_single_modality(cfg)
+                return name, result
+
+        tasks = [detect_with_sem(name) for name in model_names]
+        task_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        import time as _time
+        now_ts = _time.time()
+        results = {}
+        for tr in task_results:
+            if isinstance(tr, Exception):
+                continue
+            name, result = tr
+            results[name] = result
+            if save:
+                for m in raw_models:
+                    if m.get("name") == name:
+                        # 写入 pending_modalities 而非直接写入 modalities
+                        m["pending_modalities"] = result["modalities"]
+                        m["pending_modalities_detected_at"] = now_ts
+                        break
+
+        if save:
+            config.set("models", raw_models)
+            try:
+                config.save()
+            except Exception:
+                pass
+
+        return {"results": results}
+
+    @app.post("/admin/api/models/detect-modalities/stream")
+    async def api_detect_modalities_stream(request: Request, _admin=Depends(require_admin)):
+        """流式检测模型模态，通过 SSE 逐个返回进度。
+
+        模态检测结果写入 pending_modalities，需确认后才生效。
+        """
+        body = await request.json()
+        model_names = body.get("model_names", [])
+        save = body.get("save", False)
+        action = body.get("action", "modalities")
+
+        if not model_names:
+            raise HTTPException(status_code=400, detail="model_names 不能为空")
+
+        models = config.get_models()
+        raw_models = config.get("models", [])
+
+        model_cfg_map = {}
+        for m in models:
+            name = m.get("name")
+            if name and name in model_names:
+                model_cfg_map[name] = m
+
+        import time as _time
+
+        async def event_stream():
+            total = len(model_names)
+            completed = 0
+            now_ts = _time.time()
+            for model_name in model_names:
+                cfg = model_cfg_map.get(model_name)
+                if not cfg:
+                    completed += 1
+                    result = {"modalities": ["text"], "method": "not_found", "detail": "模型未找到"}
+                    yield f"data: {json.dumps({'model': model_name, 'result': result, 'progress': completed, 'total': total, 'action': action})}\n\n"
+                    continue
+
+                if action == "balance":
+                    result = await _detect_single_balance(cfg)
+                elif action == "price":
+                    result = await _detect_single_price(cfg)
+                else:
+                    result = await _detect_single_modality(cfg)
+
+                completed += 1
+
+                if save:
+                    for m in raw_models:
+                        if m.get("name") == model_name:
+                            if action == "modalities" and "modalities" in result:
+                                # 写入 pending_modalities 而非直接写入 modalities
+                                m["pending_modalities"] = result["modalities"]
+                                m["pending_modalities_detected_at"] = now_ts
+                            elif action == "balance" and "balance" in result:
+                                m["balance_manual"] = result["balance"]
+                            elif action == "price" and result.get("method") == "query":
+                                if result.get("price_input") is not None:
+                                    m["price_input"] = result["price_input"]
+                                if result.get("price_output") is not None:
+                                    m["price_output"] = result["price_output"]
+                            break
+
+                yield f"data: {json.dumps({'model': model_name, 'result': result, 'progress': completed, 'total': total, 'action': action}, ensure_ascii=False)}\n\n"
+
+            if save:
+                config.set("models", raw_models)
+                try:
+                    config.save()
+                except Exception:
+                    pass
+
+            yield f"data: {json.dumps({'done': True, 'total': total, 'action': action})}\n\n"
+
+        return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+    @app.post("/admin/api/models/confirm-modalities")
+    async def api_confirm_modalities(request: Request, _admin=Depends(require_admin)):
+        """确认待生效的模态检测结果，将其应用到 modalities 字段。
+
+        也可用于拒绝（discard=True），清除 pending_modalities。
+        """
+        body = await request.json()
+        model_names = body.get("model_names", [])
+        discard = body.get("discard", False)
+
+        if not model_names:
+            raise HTTPException(status_code=400, detail="model_names 不能为空")
+
+        raw_models = config.get("models", [])
+        updated = []
+
+        for m in raw_models:
+            name = m.get("name")
+            if name and name in model_names:
+                pending = m.get("pending_modalities")
+                if pending is not None:
+                    if discard:
+                        # 拒绝：清除 pending 状态
+                        m["pending_modalities"] = None
+                        m["pending_modalities_detected_at"] = None
+                    else:
+                        # 确认：将 pending 应用到 modalities
+                        m["modalities"] = pending
+                        m["pending_modalities"] = None
+                        m["pending_modalities_detected_at"] = None
+                    updated.append(name)
+
+        if updated:
+            config.set("models", raw_models)
+            try:
+                config.save()
+            except Exception:
+                pass
+
+        return {"updated": updated, "action": "discard" if discard else "confirm"}
+
+    @app.post("/admin/api/models/apply-pending-modalities")
+    async def api_apply_pending_modalities(_admin=Depends(require_admin)):
+        """将超过24h未确认的 pending_modalities 自动应用到 modalities。
+
+        可由定时任务或手动触发。
+        """
+        import time as _time
+        AUTO_CONFIRM_SECONDS = 24 * 3600  # 24小时
+        now_ts = _time.time()
+
+        raw_models = config.get("models", [])
+        auto_applied = []
+
+        for m in raw_models:
+            pending = m.get("pending_modalities")
+            detected_at = m.get("pending_modalities_detected_at")
+            if pending is not None and detected_at is not None:
+                if now_ts - detected_at >= AUTO_CONFIRM_SECONDS:
+                    m["modalities"] = pending
+                    m["pending_modalities"] = None
+                    m["pending_modalities_detected_at"] = None
+                    auto_applied.append(m.get("name"))
+
+        if auto_applied:
+            config.set("models", raw_models)
+            try:
+                config.save()
+            except Exception:
+                pass
+
+        return {"auto_applied": auto_applied, "count": len(auto_applied)}
+
+    @app.post("/admin/api/models/batch-update")
+    async def api_batch_update_models(request: Request, _admin=Depends(require_admin)):
+        """批量更新模型配置字段。"""
+        body = await request.json()
+        model_names = body.get("model_names", [])
+        updates = body.get("updates", {})
+
+        if not model_names:
+            raise HTTPException(status_code=400, detail="model_names 不能为空")
+        if not updates:
+            raise HTTPException(status_code=400, detail="updates 不能为空")
+
+        models = config.get("models", [])
+        updated = 0
+        for m in models:
+            if m.get("name") in model_names:
+                for key, value in updates.items():
+                    m[key] = value
+                updated += 1
+
+        if updated > 0:
+            config.set("models", models)
+            try:
+                config.save()
+            except Exception:
+                pass
+
+        return {"status": "ok", "updated": updated}
 
     @app.post("/admin/api/models/{model_name:path}/clone")
     async def api_clone_model(model_name: str, request: Request, _admin=Depends(require_admin)):
@@ -1291,8 +2155,191 @@ def create_app(predictor_instance=None) -> FastAPI:
 
     @app.post("/admin/api/models/{model_name:path}/test")
     async def api_test_model(model_name: str, _admin=Depends(require_admin)):
-        balance = pricing_manager.refresh_balance(model_name)
+        loop = asyncio.get_event_loop()
+        balance = await loop.run_in_executor(None, pricing_manager.refresh_balance, model_name)
         return {"model": model_name, "balance": balance}
+
+    # ------------------------------------------------------------------ #
+    # Provider（提供方）管理 API
+    # ------------------------------------------------------------------ #
+    @app.get("/admin/api/providers")
+    async def api_providers(_admin=Depends(require_admin)):
+        """获取所有提供方列表。"""
+        providers = config.get_providers()
+        # 只读取一次模型列表，避免 N 个 provider 重复读取
+        models = config.get("models", [])
+        for p in providers:
+            if p.get("api_key"):
+                key = p["api_key"]
+                p["api_key"] = key[:8] + "***" if len(key) > 8 else "***"
+            p["model_count"] = sum(1 for m in models if m.get("provider") == p["name"])
+        return {"providers": providers}
+
+    @app.post("/admin/api/providers")
+    async def api_update_providers(request: Request, _admin=Depends(require_admin)):
+        """更新提供方列表。"""
+        body = await request.json()
+        providers_data = body.get("providers", [])
+        # 保存前，合并已有的 api_key（前端传来的可能是脱敏的）
+        existing_providers = config.get("providers", [])
+        existing_keys = {p["name"]: p.get("api_key", "") for p in existing_providers}
+        for p in providers_data:
+            key = p.get("api_key", "")
+            if key.endswith("***"):
+                original = existing_keys.get(p["name"], "")
+                if original:
+                    p["api_key"] = original
+            # 清理前端辅助字段
+            p.pop("model_count", None)
+        config.set("providers", providers_data)
+        try:
+            config.save()
+        except Exception:
+            pass
+        return {"status": "ok"}
+
+    @app.post("/admin/api/providers/{provider_name}/test-balance")
+    async def api_test_provider_balance(provider_name: str, _admin=Depends(require_admin)):
+        """测试提供方的余额获取（通过脚本或内置策略）。"""
+        provider = config.get_provider(provider_name)
+        if not provider:
+            raise HTTPException(status_code=404, detail="提供方不存在")
+        # 尝试通过脚本获取余额
+        from core.script_engine import execute_balance_script
+        balance = None
+        balance_currency = None
+        if provider.get("balance_script", "").strip():
+            loop = asyncio.get_event_loop()
+            script_result = await loop.run_in_executor(
+                None, execute_balance_script,
+                provider["balance_script"], provider.get("api_key", ""), provider.get("base_url", ""), ""
+            )
+            if script_result is not None:
+                balance = script_result["balance"]
+                balance_currency = script_result.get("balance_currency")
+        if balance is None and provider.get("balance_manual") is not None:
+            balance = provider["balance_manual"]
+            balance_currency = provider.get("balance_currency")
+        if balance is None:
+            # 尝试内置策略
+            api_type = provider.get("api_type", "local")
+            checker = BalanceCheckerFactory.get_checker(api_type)
+            try:
+                loop = asyncio.get_event_loop()
+                balance = await loop.run_in_executor(None, checker.check, provider)
+                if balance is not None:
+                    balance_currency = pricing_manager._infer_balance_currency(provider, api_type)
+            except Exception:
+                pass
+        # 推断货币单位
+        if balance is not None and balance_currency is None:
+            api_type = provider.get("api_type", "local")
+            balance_currency = pricing_manager._infer_balance_currency(provider, api_type)
+        # 低余额通知
+        if balance is not None and balance <= 0:
+            notifier.notify(
+                event=f"balance_exhausted:{provider_name}",
+                severity="critical",
+                title=f"供应商余额耗尽: {provider_name}",
+                message=f"供应商 {provider_name} 余额已耗尽 ({balance} {balance_currency or ''})，请及时充值。",
+            )
+        elif balance is not None and balance < 1.0:
+            notifier.notify(
+                event=f"balance_low:{provider_name}",
+                severity="warning",
+                title=f"供应商余额不足: {provider_name}",
+                message=f"供应商 {provider_name} 余额仅剩 {balance} {balance_currency or ''}，建议尽快充值。",
+            )
+        return {"provider": provider_name, "balance": balance, "balance_currency": balance_currency}
+
+    @app.post("/admin/api/providers/{provider_name}/test-price")
+    async def api_test_provider_price(provider_name: str, request: Request, _admin=Depends(require_admin)):
+        """测试提供方的单价获取（通过脚本）。"""
+        provider = config.get_provider(provider_name)
+        if not provider:
+            raise HTTPException(status_code=404, detail="提供方不存在")
+        body = await request.json()
+        model_name = body.get("model_name", "")
+        from core.script_engine import execute_price_script
+        result = None
+        if provider.get("price_script", "").strip():
+            result = execute_price_script(
+                script=provider["price_script"],
+                api_key=provider.get("api_key", ""),
+                base_url=provider.get("base_url", ""),
+                model_name=model_name,
+            )
+        # 推断未指定的单位字段
+        if result is not None:
+            api_type = provider.get("api_type", "local")
+            if result.get("price_currency") is None:
+                result["price_currency"] = pricing_manager._infer_price_currency(provider, api_type)
+            if result.get("price_unit") is None:
+                result["price_unit"] = pricing_manager._infer_price_unit(provider, api_type)
+        return {"provider": provider_name, "model_name": model_name, "price": result}
+
+    @app.post("/admin/api/script/test")
+    async def api_test_script(request: Request, _admin=Depends(require_admin)):
+        """测试脚本语法。"""
+        body = await request.json()
+        script = body.get("script", "")
+        script_type = body.get("script_type", "balance")
+        from core.script_engine import test_script
+        result = test_script(script, script_type)
+        return result
+
+    @app.post("/admin/api/script/execute")
+    async def api_execute_script(request: Request, _admin=Depends(require_admin)):
+        """执行脚本并返回结果（用于调试）。"""
+        body = await request.json()
+        script = body.get("script", "")
+        script_type = body.get("script_type", "balance")
+        api_key = body.get("api_key", "")
+        base_url = body.get("base_url", "")
+        model_name = body.get("model_name", "")
+        loop = asyncio.get_event_loop()
+        if script_type == "balance":
+            from core.script_engine import execute_balance_script
+            result = await loop.run_in_executor(None, execute_balance_script, script, api_key, base_url, model_name)
+            # 推断余额货币单位
+            balance_currency = None
+            if result is not None:
+                balance_currency = result.get("balance_currency")
+                if balance_currency is None:
+                    # 尝试从提供方推断
+                    providers = config.get_providers()
+                    for p in providers:
+                        if p.get("api_key", "") == api_key or p.get("base_url", "") == base_url:
+                            balance_currency = pricing_manager._infer_balance_currency(p, p.get("api_type", "local"))
+                            break
+                    if balance_currency is None:
+                        balance_currency = config.currency
+            return {"result": result, "type": "balance", "balance_currency": balance_currency}
+        else:
+            from core.script_engine import execute_price_script
+            result = await loop.run_in_executor(None, execute_price_script, script, api_key, base_url, model_name)
+            # 推断单价单位
+            if result is not None:
+                providers = config.get_providers()
+                api_type = "local"
+                for p in providers:
+                    if p.get("api_key", "") == api_key or p.get("base_url", "") == base_url:
+                        api_type = p.get("api_type", "local")
+                        break
+                if result.get("price_currency") is None:
+                    result["price_currency"] = pricing_manager._infer_price_currency({"api_type": api_type}, api_type)
+                if result.get("price_unit") is None:
+                    result["price_unit"] = pricing_manager._infer_price_unit({"api_type": api_type}, api_type)
+            return {"result": result, "type": "price"}
+
+    @app.get("/admin/api/script/help")
+    async def api_script_help(_admin=Depends(require_admin)):
+        """获取脚本编写说明。"""
+        from core.script_engine import BALANCE_SCRIPT_HELP, PRICE_SCRIPT_HELP
+        return {
+            "balance_script_help": BALANCE_SCRIPT_HELP,
+            "price_script_help": PRICE_SCRIPT_HELP,
+        }
 
     @app.get("/admin/api/metrics")
     async def api_metrics(_admin=Depends(require_admin)):
@@ -1413,10 +2460,198 @@ def create_app(predictor_instance=None) -> FastAPI:
             pass
         return {"status": "ok"}
 
+    # ------------------------------------------------------------------ #
+    # 配置子路由 API（/admin/api/config/xxx）
+    # 前端使用 /config/xxx 前缀调用，此处提供对应路由
+    # ------------------------------------------------------------------ #
+    @app.post("/admin/api/config/reload")
+    async def api_config_reload(_admin=Depends(require_admin)):
+        """重新加载配置文件。"""
+        config.reload()
+        return {"status": "ok"}
+
+    @app.put("/admin/api/config/basic")
+    async def api_config_basic(request: Request, _admin=Depends(require_admin)):
+        """更新基本设置。"""
+        body = await request.json()
+        for k, v in body.items():
+            if k in ("models", "providers", "admin_password", "api_key", "ssh_key"):
+                continue
+            config.set(k, v)
+        try:
+            config.save()
+        except Exception as e:
+            logger.error("保存基本设置失败: %s", e)
+        return {"status": "ok"}
+
+    @app.put("/admin/api/config/route-weights")
+    async def api_config_route_weights(request: Request, _admin=Depends(require_admin)):
+        """更新路由权重配置。"""
+        body = await request.json()
+        config.set("route_weights", body)
+        try:
+            config.save()
+        except Exception as e:
+            logger.error("保存路由权重失败: %s", e)
+        return {"status": "ok"}
+
+    @app.put("/admin/api/config/rl")
+    async def api_config_rl(request: Request, _admin=Depends(require_admin)):
+        """更新强化学习配置。"""
+        body = await request.json()
+        config.set("rl_config", body)
+        try:
+            config.save()
+        except Exception as e:
+            logger.error("保存RL配置失败: %s", e)
+        return {"status": "ok"}
+
+    @app.put("/admin/api/config/health-check")
+    async def api_config_health_check(request: Request, _admin=Depends(require_admin)):
+        """更新健康检查配置。"""
+        body = await request.json()
+        config.set("health_check", body)
+        try:
+            config.save()
+        except Exception as e:
+            logger.error("保存健康检查配置失败: %s", e)
+        return {"status": "ok"}
+
+    @app.put("/admin/api/config/storage")
+    async def api_config_storage(request: Request, _admin=Depends(require_admin)):
+        """更新存储配置。"""
+        body = await request.json()
+        config.set("storage", body)
+        try:
+            config.save()
+        except Exception as e:
+            logger.error("保存存储配置失败: %s", e)
+        return {"status": "ok"}
+
+    @app.put("/admin/api/config/web")
+    async def api_config_web(request: Request, _admin=Depends(require_admin)):
+        """更新 Web 配置。"""
+        body = await request.json()
+        config.set("web", body)
+        try:
+            config.save()
+        except Exception as e:
+            logger.error("保存Web配置失败: %s", e)
+        return {"status": "ok"}
+
+    @app.put("/admin/api/config/exchange-rates")
+    async def api_config_exchange_rates(request: Request, _admin=Depends(require_admin)):
+        """更新汇率配置。"""
+        body = await request.json()
+        rates = body.get("exchange_rates", body)
+        config.set("exchange_rates", rates)
+        try:
+            config.save()
+        except Exception as e:
+            logger.error("保存汇率配置失败: %s", e)
+        return {"status": "ok"}
+
+    @app.put("/admin/api/config/model-aliases")
+    async def api_config_model_aliases(request: Request, _admin=Depends(require_admin)):
+        """更新模型别名配置。"""
+        body = await request.json()
+        config.set("model_aliases", body)
+        try:
+            config.save()
+        except Exception as e:
+            logger.error("保存模型别名失败: %s", e)
+        return {"status": "ok"}
+
+    @app.post("/admin/api/config/difficulty-ranges")
+    async def api_config_difficulty_ranges(request: Request, _admin=Depends(require_admin)):
+        """更新难度范围配置。"""
+        body = await request.json()
+        ranges = body.get("difficulty_ranges")
+        if not ranges or not isinstance(ranges, list):
+            raise HTTPException(status_code=400, detail="difficulty_ranges 必须为非空数组")
+        for r in ranges:
+            if not isinstance(r, dict):
+                raise HTTPException(status_code=400, detail="每条范围必须为对象")
+            if "min_tokens" not in r or "max_tokens" not in r or "difficulty" not in r:
+                raise HTTPException(status_code=400, detail="每条范围必须包含 min_tokens, max_tokens, difficulty")
+            if not (1 <= int(r["difficulty"]) <= 100):
+                raise HTTPException(status_code=400, detail="difficulty 必须为 1-100")
+        config.difficulty_ranges = ranges
+        try:
+            config.save()
+        except Exception as e:
+            logger.error("保存难度范围失败: %s", e)
+        return {"status": "ok", "difficulty_ranges": ranges}
+
+    @app.put("/admin/api/config/notifications")
+    async def api_config_notifications(request: Request, _admin=Depends(require_admin)):
+        """更新通知配置。"""
+        body = await request.json()
+        config.set("notifications", body)
+        try:
+            config.save()
+        except Exception as e:
+            logger.error("保存通知配置失败: %s", e)
+        return {"status": "ok"}
+
+    @app.post("/admin/api/config/notifications/test")
+    async def api_test_notification(request: Request, _admin=Depends(require_admin)):
+        """测试通知渠道。"""
+        body = await request.json()
+        channel = body.get("channel", {})
+        ch_type = channel.get("type", "")
+        title = "SmartRouter 通知测试"
+        message = "这是一条测试通知，如果您收到此消息，说明通知渠道配置正确。"
+        success = False
+        try:
+            if ch_type == "webhook":
+                from core.notifier import _send_webhook
+                success = _send_webhook(channel["url"], {"title": title, "message": message})
+            elif ch_type == "dingtalk":
+                from core.notifier import _send_dingtalk
+                success = _send_dingtalk(channel["url"], title, message)
+            elif ch_type == "wecom":
+                from core.notifier import _send_wecom
+                success = _send_wecom(channel["url"], message)
+            elif ch_type == "feishu":
+                from core.notifier import _send_feishu
+                success = _send_feishu(channel["url"], title, message)
+            elif ch_type == "telegram":
+                from core.notifier import _send_telegram
+                success = _send_telegram(channel["bot_token"], channel["chat_id"], f"*{title}*\n{message}")
+            elif ch_type == "slack":
+                from core.notifier import _send_slack
+                success = _send_slack(channel["url"], f"*{title}*\n{message}")
+            elif ch_type == "email":
+                from core.notifier import _send_email
+                success = _send_email(
+                    channel.get("smtp_host", ""), int(channel.get("smtp_port", 587)),
+                    channel.get("smtp_user", ""), channel.get("smtp_pass", ""),
+                    channel.get("from", ""), channel.get("to", "").split(","),
+                    title, message,
+                )
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+        return {"success": success}
+
     @app.post("/admin/api/sync-prices")
-    async def api_sync_prices(_admin=Depends(require_admin)):
-        """手动触发价格同步。"""
-        updated = pricing_manager.sync_prices_now()
+    async def api_sync_prices(request: Request, _admin=Depends(require_admin)):
+        """手动触发价格同步，支持按提供方或模型过滤。
+
+        Body 参数（可选）:
+        - provider_name: 仅更新指定提供方的模型
+        - model_name: 仅更新指定模型
+        - 不传参数则更新全部
+        """
+        body = {}
+        try:
+            body = await request.json()
+        except Exception:
+            pass
+        provider_name = body.get("provider_name") if body else None
+        model_name = body.get("model_name") if body else None
+        loop = asyncio.get_event_loop()
+        updated = await loop.run_in_executor(None, pricing_manager.sync_prices_now, provider_name, model_name)
         if updated < 0:
             raise HTTPException(status_code=500, detail="价格同步失败")
         return {"status": "ok", "updated_models": updated}
@@ -1429,7 +2664,8 @@ def create_app(predictor_instance=None) -> FastAPI:
     @app.post("/admin/api/exchange-rate/sync")
     async def api_exchange_rate_sync(_admin=Depends(require_admin)):
         """手动触发汇率同步。"""
-        success = exchange_rate_manager.sync_now()
+        loop = asyncio.get_event_loop()
+        success = await loop.run_in_executor(None, exchange_rate_manager.sync_now)
         if not success:
             raise HTTPException(status_code=500, detail="汇率同步失败")
         return {"status": "ok"}
@@ -1807,6 +3043,46 @@ def create_app(predictor_instance=None) -> FastAPI:
         return db.get_route_log_stats()
 
     # ------------------------------------------------------------------ #
+    # API 调用日志 API
+    # ------------------------------------------------------------------ #
+    @app.get("/admin/api/api-logs")
+    async def api_api_logs(
+        limit: int = 100,
+        offset: int = 0,
+        model: Optional[str] = None,
+        status_code: Optional[int] = None,
+        _admin=Depends(require_admin),
+    ):
+        """获取 API 调用日志列表。"""
+        logs = db.get_api_logs(limit=limit, offset=offset, model=model, status_code=status_code)
+        total = db.count_api_logs(model=model, status_code=status_code)
+        stats = db.get_api_log_stats()
+        return {
+            "logs": logs,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "stats": stats,
+        }
+
+    @app.delete("/admin/api/api-logs")
+    async def api_clear_api_logs(
+        max_age_days: Optional[int] = None,
+        _admin=Depends(require_admin),
+    ):
+        """清除 API 调用日志。"""
+        if max_age_days and max_age_days > 0:
+            deleted = db.clear_old_api_logs(max_age_days)
+        else:
+            deleted = db.clear_all_api_logs()
+        return {"deleted": deleted}
+
+    @app.get("/admin/api/api-logs/stats")
+    async def api_api_log_stats(_admin=Depends(require_admin)):
+        """获取 API 调用日志统计。"""
+        return db.get_api_log_stats()
+
+    # ------------------------------------------------------------------ #
     # 后备链日志 API
     # ------------------------------------------------------------------ #
     @app.get("/admin/api/fallback-logs")
@@ -1859,6 +3135,146 @@ def create_app(predictor_instance=None) -> FastAPI:
         }
 
     # ------------------------------------------------------------------ #
+    # 批量并发接口：一次请求同时发起多个 chat completions 调用
+    # ------------------------------------------------------------------ #
+    @app.post("/v1/chat/completions/batch")
+    async def batch_proxy(request: Request, _auth=Depends(check_api_key)):
+        """批量并发调用接口。
+
+        请求体格式：
+        {
+            "requests": [
+                {"model": "auto", "messages": [...], "stream": false},
+                {"model": "deepseek-v4-flash", "messages": [...], "stream": false},
+                ...
+            ]
+        }
+
+        响应格式：
+        {
+            "object": "batch",
+            "data": [
+                {"index": 0, "status": 200, "body": {...}},
+                {"index": 1, "status": 500, "error": "..."},
+                ...
+            ]
+        }
+
+        限制：单次最多 10 个请求，且不支持流式（批量请求统一非流式返回）。
+        """
+        body = await request.json()
+        requests_list = body.get("requests", [])
+        if not requests_list:
+            raise OpenAIError(400, "requests field is required and must be non-empty", "invalid_request_error")
+        if len(requests_list) > 10:
+            raise OpenAIError(400, "Maximum 10 requests per batch", "invalid_request_error")
+
+        async def _handle_single(index: int, req_body: Dict[str, Any]) -> Dict[str, Any]:
+            """处理单个批量请求。"""
+            try:
+                # 强制非流式
+                req_body["stream"] = False
+                req_body.pop("stream_options", None)
+
+                # 模型名映射
+                requested_model = req_body.get("model", "")
+                is_auto_route = (requested_model == "auto" or requested_model == "")
+                resolved_model = config.resolve_model_name(requested_model) if not is_auto_route else ""
+                if resolved_model != requested_model and not is_auto_route:
+                    req_body["model"] = resolved_model
+
+                prompt = _extract_prompt(req_body)
+                request_id = f"batch-{uuid.uuid4().hex[:8]}-{index}"
+
+                # 智能路由
+                diff, est_tok = app.state.predictor.predict(prompt)
+                task_type = detect_task_type(prompt)
+                keyword_model = detect_model_keyword(prompt, pricing_manager.get_available_models())
+
+                selected = None
+                route_source = "auto"
+                if keyword_model:
+                    selected = config.get_model(keyword_model)
+                    if selected and pricing_manager.is_within_active_hours(selected.get("active_hours")):
+                        route_source = "keyword"
+                    else:
+                        selected = None
+                if not selected and is_auto_route:
+                    selected = app.state.router.select_model(diff, est_tok, est_tok, task_type=task_type)
+                    route_source = "auto"
+                elif not selected and requested_model:
+                    selected = config.get_model(requested_model)
+                    route_source = "direct"
+                if not selected:
+                    selected = config.get_fallback_model()
+                    route_source = "fallback"
+                if not selected:
+                    return {"index": index, "status": 503, "error": "No model available"}
+
+                # 构建上游请求
+                upstream_model = selected.get("upstream_model_name") or selected["name"]
+                req_body["model"] = upstream_model
+                headers = _build_upstream_headers(selected)
+                try:
+                    url = _build_upstream_url(selected)
+                except ValueError as e:
+                    return {"index": index, "status": 400, "error": str(e)}
+
+                # 发送请求
+                client = await _get_http_client()
+                t0 = time.perf_counter()
+                resp = await client.post(url, json=req_body, headers=headers)
+                latency_ms = int((time.perf_counter() - t0) * 1000)
+
+                if resp.status_code >= 400:
+                    error_msg = ""
+                    try:
+                        error_data = resp.json()
+                        error_msg = error_data.get("error", {}).get("message", str(error_data)) if isinstance(error_data, dict) else str(error_data)
+                    except Exception:
+                        error_msg = resp.text[:500]
+                    return {"index": index, "status": resp.status_code, "error": error_msg}
+
+                # 处理响应
+                content_type = resp.headers.get("content-type", "")
+                if "text/event-stream" in content_type:
+                    full_content, usage_info = _collect_sse_text(resp.text)
+                    resp_data = _build_non_stream_response(selected["name"], full_content, usage_info)
+                else:
+                    resp_data = resp.json()
+                    resp_data["model"] = selected["name"]
+
+                # 异步记录日志
+                usage_info = resp_data.get("usage", {})
+                asyncio.create_task(
+                    _after_call(
+                        request=request,
+                        request_id=request_id, prompt=prompt, diff=diff,
+                        est_tokens=est_tok, selected=selected,
+                        latency_ms=latency_ms, success=True,
+                        collected_content=resp_data.get("choices", [{}])[0].get("message", {}).get("content", ""),
+                        usage_info=usage_info, task_type=task_type,
+                        route_source=route_source,
+                        requested_model_name=requested_model or "auto",
+                        route_chain=[selected["name"]],
+                    content_types=content_types,
+                    )
+                )
+
+                return {"index": index, "status": 200, "body": resp_data}
+            except Exception as exc:  # noqa: BLE001
+                return {"index": index, "status": 500, "error": str(exc)}
+
+        # 并发执行所有请求
+        tasks = [_handle_single(i, req) for i, req in enumerate(requests_list)]
+        results = await asyncio.gather(*tasks)
+
+        return {
+            "object": "batch",
+            "data": list(results),
+        }
+
+    # ------------------------------------------------------------------ #
     # 健康检查
     # ------------------------------------------------------------------ #
     @app.get("/health")
@@ -1867,6 +3283,76 @@ def create_app(predictor_instance=None) -> FastAPI:
             "status": "ok",
             "predictor_ready": app.state.predictor.is_ready,
             "queue_size": app.state.predictor.queue_size,
+            "concurrency": {
+                "max": max_concurrency,
+                "available": _concurrency_semaphore._value if _concurrency_semaphore else 0,
+            },
+        }
+
+    # ------------------------------------------------------------------ #
+    # 慢查询记录 API
+    # ------------------------------------------------------------------ #
+    @app.get("/admin/api/slow-queries")
+    async def get_slow_queries(_admin=Depends(require_admin)):
+        """获取最近的慢查询记录（超过5秒的请求）"""
+        return {"slow_queries": _slow_query_log, "threshold_ms": _SLOW_QUERY_THRESHOLD_MS}
+
+    # ------------------------------------------------------------------ #
+    # 大屏展示 API（无需认证，适合投屏展示）
+    # ------------------------------------------------------------------ #
+    @app.get("/admin/api/bigscreen")
+    async def bigscreen_data():
+        """大屏展示数据接口：汇总关键指标，适合投屏/大屏展示"""
+        # 获取仪表盘数据（今日统计）
+        now = time.time()
+        since = now - 86400  # 最近24小时
+        stats = db.get_dashboard_stats(since)
+
+        # 获取模型列表（仅基本信息）
+        models_info = []
+        for m in config.get_models():
+            models_info.append({
+                "name": m.get("name", ""),
+                "provider": m.get("provider", ""),
+                "enabled": m.get("enabled", True),
+            })
+
+        # 获取并发信息
+        concurrency_info = {
+            "max": max_concurrency,
+            "available": _concurrency_semaphore._value if _concurrency_semaphore else 0,
+            "in_use": max_concurrency - (_concurrency_semaphore._value if _concurrency_semaphore else 0),
+        }
+
+        # 获取预测器状态
+        predictor_info = {
+            "is_ready": app.state.predictor.is_ready,
+            "queue_size": app.state.predictor.queue_size,
+        }
+
+        # 获取最近慢查询
+        recent_slow = _slow_query_log[-5:] if _slow_query_log else []
+
+        # 汇率转换：将 saved_cost_by_currency 转为当前显示货币
+        target_currency = config.currency
+        total_saved = 0.0
+        for item in stats.get("saved_cost_by_currency", []):
+            cur = item.get("cost_currency", "USD")
+            val = float(item.get("s", 0))
+            total_saved += float(exchange_rate_manager.convert(val, cur, target_currency))
+        stats["saved_cost"] = round(total_saved, 6)
+        stats["cost_currency"] = target_currency
+
+        return {
+            "timestamp": time.time(),
+            "stats": stats,
+            "models": models_info,
+            "model_count": len(models_info),
+            "enabled_count": sum(1 for m in models_info if m["enabled"]),
+            "concurrency": concurrency_info,
+            "predictor": predictor_info,
+            "recent_slow_queries": recent_slow,
+            "slow_query_threshold_ms": _SLOW_QUERY_THRESHOLD_MS,
         }
 
     # ------------------------------------------------------------------ #
@@ -1874,20 +3360,32 @@ def create_app(predictor_instance=None) -> FastAPI:
     # ------------------------------------------------------------------ #
     web_dist = Path(__file__).resolve().parent.parent / "web" / "dist"
     if web_dist.exists():
-        # 自定义 StaticFiles 子类，添加 no-cache 头防止浏览器缓存旧页面
-        class NoCacheStaticFiles(StaticFiles):
+        # 智能缓存策略：
+        # - HTML 文件（index.html）：不缓存，确保用户始终获取最新版本
+        # - JS/CSS 等静态资源：缓存 1 小时，大幅减少重复加载时间
+        #   （这些文件名不含 hash，但版本更新时 HTML 引用不变，所以缓存时间不宜过长）
+        class SmartCacheStaticFiles(StaticFiles):
             async def __call__(self, scope, receive, send):
-                async def send_with_no_cache(message):
+                # 从 scope 中获取请求路径
+                path = scope.get("path", "") if isinstance(scope, dict) else ""
+                is_html = path.endswith("/") or path.endswith(".html") or path == ""
+
+                async def send_with_cache(message):
                     if message["type"] == "http.response.start":
                         headers = dict(message.get("headers", []))
-                        headers[b"cache-control"] = b"no-cache, no-store, must-revalidate"
-                        headers[b"pragma"] = b"no-cache"
-                        headers[b"expires"] = b"0"
+                        if is_html:
+                            # HTML 不缓存
+                            headers[b"cache-control"] = b"no-cache, no-store, must-revalidate"
+                            headers[b"pragma"] = b"no-cache"
+                            headers[b"expires"] = b"0"
+                        else:
+                            # 静态资源缓存 1 小时
+                            headers[b"cache-control"] = b"public, max-age=3600"
                         message["headers"] = list(headers.items())
                     await send(message)
-                await super().__call__(scope, receive, send_with_no_cache)
+                await super().__call__(scope, receive, send_with_cache)
 
-        app.mount("/admin", NoCacheStaticFiles(directory=str(web_dist), html=True), name="admin")
+        app.mount("/admin", SmartCacheStaticFiles(directory=str(web_dist), html=True), name="admin")
 
     return app
 

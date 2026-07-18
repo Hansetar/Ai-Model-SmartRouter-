@@ -376,6 +376,7 @@ class SmartRouter:
         exclude: Optional[List[str]] = None,
         task_type: Optional[str] = None,
         predictor_recommendation: Optional[str] = None,
+        content_types: Optional[List[str]] = None,
     ) -> Optional[Dict[str, Any]]:
         """选取花费最少且能胜任的模型。
 
@@ -400,6 +401,38 @@ class SmartRouter:
         score_weight = float(route_weights.get("score_weight", 0.5))
         model_preferences = route_weights.get("model_preferences", {})
 
+        # 路由策略配置
+        route_strategy = config.data.get("route_strategy", {}) if hasattr(config, "data") else {}
+        strategy_mode = route_strategy.get("mode", "difficulty_match")
+        cost_w = float(route_strategy.get("cost_weight", 0.3))
+        quality_w = float(route_strategy.get("quality_weight", 0.7))
+        price_ceiling = float(route_strategy.get("price_ceiling", 0))
+
+        # 时段规则：检查当前时间是否匹配时段规则
+        time_based_rules = route_strategy.get("time_based_rules", "")
+        if time_based_rules:
+            try:
+                import json as _json
+                from datetime import datetime as _dt
+                rules = _json.loads(time_based_rules) if isinstance(time_based_rules, str) else time_based_rules
+                now_hour = _dt.now().hour
+                for rule in rules:
+                    hours_str = rule.get("hours", "")
+                    if "-" in hours_str:
+                        parts = hours_str.split("-")
+                        start_h = int(parts[0].split(":")[0])
+                        end_h = int(parts[1].split(":")[0])
+                        if start_h > end_h:  # 跨天，如 22:00-6:00
+                            if now_hour >= start_h or now_hour < end_h:
+                                strategy_mode = rule.get("mode", strategy_mode)
+                                break
+                        else:
+                            if start_h <= now_hour < end_h:
+                                strategy_mode = rule.get("mode", strategy_mode)
+                                break
+            except Exception:
+                pass
+
         candidates: List[Dict[str, Any]] = []
 
         for model in available:
@@ -411,13 +444,18 @@ class SmartRouter:
             if model.get("capability", 0) < difficulty:
                 continue
 
-            # 2. 过滤余额耗尽的付费模型
+            # 1.5 过滤不支持所需模态的模型
+            if content_types and not self._supports_content_types(model, content_types):
+                continue
+
+            # 2. 余额惩罚：余额耗尽的付费模型降低优先级而非排除
+            # （余额查询可能不准确，且实际调用失败会走后备链重试）
             price_input = float(model.get("price_input", 0))
             price_output = float(model.get("price_output", 0))
-            if price_input > 0 or price_output > 0:
-                balance = model.get("balance")
-                if balance is not None and balance <= 0:
-                    continue
+            balance = model.get("balance")
+            balance_penalty = 0.0
+            if (price_input > 0 or price_output > 0) and balance is not None and balance <= 0:
+                balance_penalty = 1000.0  # 大幅降权，但不完全排除
 
             # 3. 计算预估花费（免费模型为 0，统一转为用户选择的货币）
             # price_input/price_output 的单位由 price_unit 决定（默认 1M=每百万token）
@@ -450,10 +488,38 @@ class SmartRouter:
             # 9. 综合评分（越低越好）
             # predictor_score 越高越好（1.0=推荐），score_value 越低越好
             # 归一化：将 predictor_score 反转（1.0 -> 0, 0.0 -> 1），使综合分越低越好
+
+            # 根据策略模式调整评分
+            strategy_bonus = 0.0
+            if strategy_mode == "cost_first":
+                # 成本优先：免费/便宜模型大幅加分
+                if cost <= 0:
+                    strategy_bonus = -500.0  # 免费模型大幅优先
+                else:
+                    strategy_bonus = -cost * 10.0  # 便宜模型优先
+            elif strategy_mode == "quality_first":
+                # 质量优先：高能力模型加分
+                capability = float(model.get("capability", 0))
+                strategy_bonus = -capability * 0.5
+            elif strategy_mode == "difficulty_match":
+                # 难度匹配：默认行为，简单任务用便宜模型
+                capability = float(model.get("capability", 0))
+                if difficulty <= 30 and capability <= 50:
+                    strategy_bonus = -2.0  # 简单任务+低能力模型=好匹配
+                elif difficulty >= 70 and capability >= 70:
+                    strategy_bonus = -2.0  # 困难任务+高能力模型=好匹配
+            # custom 模式不额外加分，完全依赖权重配置
+
+            # 价格上限过滤
+            if price_ceiling > 0 and cost > price_ceiling:
+                strategy_bonus += 1000.0  # 超过价格上限大幅降权
+
             combined_score = (
                 predictor_weight * (1.0 - predictor_score)  # 预测推荐：推荐模型得 0，其他得 predictor_weight
                 + score_weight * score_value                 # 评分：越低越好
                 - preference_weight                          # 偏好：减去偏好权重，使偏好模型得分更低
+                + balance_penalty                            # 余额惩罚：余额耗尽时大幅降权
+                + strategy_bonus                             # 策略加成
             )
 
             candidates.append(
@@ -472,9 +538,8 @@ class SmartRouter:
             )
 
         if not candidates:
-            # 降级：返回默认模型
-            default = config.get_default_model()
-            return default
+            # 没有能力足够的候选，返回 None 让调用方走后备链降级流程
+            return None
 
         # 按综合评分排序：combined_score 最低的优先
         candidates.sort(key=lambda x: x["combined_score"])
@@ -490,6 +555,7 @@ class SmartRouter:
         task_type: Optional[str] = None,
         predictor_recommendation: Optional[str] = None,
         top_k: int = 3,
+        content_types: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         """返回按综合评分排序的候选模型列表（用于预测推荐展示）。
 
@@ -509,6 +575,8 @@ class SmartRouter:
             if name in exclude:
                 continue
             if model.get("capability", 0) < difficulty:
+                continue
+            if content_types and not self._supports_content_types(model, content_types):
                 continue
             price_input = float(model.get("price_input", 0))
             price_output = float(model.get("price_output", 0))
@@ -596,6 +664,35 @@ class SmartRouter:
 
         return 0.5  # 不匹配，减分
 
+    @staticmethod
+    def _supports_content_types(model: Dict[str, Any], content_types: List[str]) -> bool:
+        """检查模型是否支持请求所需的所有内容类型。
+
+        模型通过 modalities 字段声明支持的模态，如 ["text", "image", "audio", "video"]。
+        - 如果模型未声明 modalities，默认只支持 text
+        - 如果请求只包含 text，所有模型都支持
+        - 如果请求包含非 text 类型，模型必须在 modalities 中声明支持
+
+        :param model: 模型配置字典
+        :param content_types: 请求涉及的内容类型列表
+        :return: True 如果模型支持所有请求的内容类型
+        """
+        # 纯文本请求，所有模型都支持
+        non_text_types = [t for t in content_types if t != "text"]
+        if not non_text_types:
+            return True
+
+        model_modalities = model.get("modalities", [])
+        # 模型未声明 modalities，默认只支持 text
+        if not model_modalities:
+            return False
+
+        # 检查模型是否支持所有非 text 的内容类型
+        for ct in non_text_types:
+            if ct not in model_modalities:
+                return False
+        return True
+
     # ------------------------------------------------------------------ #
     # 重试与容灾
     # ------------------------------------------------------------------ #
@@ -623,11 +720,15 @@ class SmartRouter:
         failed_models: List[str],
         task_type: Optional[str] = None,
         strict_capability: bool = True,
+        content_types: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
-        """获取按价格排序的后备模型链：免费 -> 便宜 -> 贵。
+        """获取按综合评分排序的后备模型链（评分由高到低，即 combined_score 由低到高）。
 
-        返回排除已失败模型后，按价格从低到高排序的所有可用模型列表。
+        返回排除已失败模型后，按综合评分排序的所有可用模型列表。
         调用方可依次尝试，直到成功为止。
+
+        排序逻辑与 select_model 一致：综合评分越低越优先。
+        严格模式下只返回能力足够的模型，宽松模式允许降级使用能力较低的模型。
 
         :param difficulty: 预测难度 1-100
         :param est_in_tokens: 预估输入 Token
@@ -637,9 +738,13 @@ class SmartRouter:
         :param strict_capability: 是否严格过滤能力不足的模型。
             True=过滤 capability<difficulty 的模型（首次路由），
             False=不过滤，允许降级使用能力较低的模型（兜底场景）
-        :return: 按价格排序的可用模型列表
+        :return: 按综合评分排序的可用模型列表（最优在前）
         """
         available = self._pricing.get_available_models()
+        route_weights = config.route_weights
+        predictor_weight = float(route_weights.get("predictor_weight", 0.5))
+        score_weight = float(route_weights.get("score_weight", 0.5))
+        model_preferences = route_weights.get("model_preferences", {})
         candidates: List[Dict[str, Any]] = []
 
         for model in available:
@@ -649,6 +754,10 @@ class SmartRouter:
 
             # 严格模式下过滤能力不足的模型
             if strict_capability and model.get("capability", 0) < difficulty:
+                continue
+
+            # 过滤不支持所需模态的模型
+            if content_types and not self._supports_content_types(model, content_types):
                 continue
 
             # 过滤余额耗尽的付费模型
@@ -670,25 +779,36 @@ class SmartRouter:
             # 任务类型匹配度
             task_match = self._calc_task_match(model, task_type)
 
-            # 历史可靠性
+            # 历史可靠性与满意度
             metrics = self._db.get_metrics(name)
             reliability = metrics["success_rate"] if metrics else 0.9
+            satisfaction = metrics["satisfaction_rate"] if metrics else 0.9
+
+            # 评分选模型分（越低越好）
+            adjusted_cost = cost / task_match if task_match > 0 else cost
+            score_value = adjusted_cost / (reliability * satisfaction + 0.01)
 
             # 能力差距惩罚：能力低于难度的模型排在后面
             capability = model.get("capability", 0)
             capability_penalty = max(0, difficulty - capability) * 10 if capability < difficulty else 0
 
+            # 用户偏好加成
+            preference_weight = float(model_preferences.get(name, 0))
+
+            # 综合评分（越低越好，与 select_model 一致）
+            combined_score = (
+                score_weight * score_value
+                - preference_weight
+                + capability_penalty  # 能力不足的模型评分更高（排后面）
+            )
+
             candidates.append({
                 "model": model,
-                "cost": cost,
-                "task_match": task_match,
-                "reliability": reliability,
-                "capability_penalty": capability_penalty,
+                "combined_score": combined_score,
             })
 
-        # 排序：免费模型优先，然后按 cost 从低到高
-        # 兜底模式下，能力不足的模型排在后面（通过 penalty）
-        candidates.sort(key=lambda x: (x["capability_penalty"], x["cost"], -x["reliability"]))
+        # 按综合评分排序：combined_score 最低的优先（权重最高）
+        candidates.sort(key=lambda x: x["combined_score"])
 
         return [c["model"] for c in candidates]
 

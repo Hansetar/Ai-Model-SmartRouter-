@@ -19,6 +19,47 @@ from core import config, db, feedback_analyzer, predictor, pricing_manager, rout
 from core.router import detect_task_type, task_type_detector
 
 
+def _extract_text_from_content(content: Any) -> str:
+    """从 content 字段提取纯文本，兼容多模态格式。"""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        text_parts = []
+        for item in content:
+            if isinstance(item, str):
+                text_parts.append(item)
+            elif isinstance(item, dict) and item.get("type") == "text":
+                text_parts.append(item.get("text", ""))
+        return " ".join(text_parts)
+    return str(content) if content is not None else ""
+
+
+def _detect_content_types(messages: list) -> list:
+    """检测请求中包含的内容类型。"""
+    types: set = set()
+    for msg in messages:
+        content = msg.get("content")
+        if isinstance(content, str):
+            types.add("text")
+        elif isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict):
+                    item_type = item.get("type", "")
+                    if item_type == "text":
+                        types.add("text")
+                    elif item_type in ("image_url", "image_file", "input_image"):
+                        types.add("image")
+                    elif item_type in ("audio_url", "input_audio"):
+                        types.add("audio")
+                    elif item_type in ("video_url", "video_file", "input_video"):
+                        types.add("video")
+                    elif item_type == "file_url":
+                        types.add("file")
+    if not types:
+        types.add("text")
+    return list(types)
+
+
 class OpenClawSmartRouterPlugin:
     """OpenClaw SmartRouter 插件。
 
@@ -60,11 +101,15 @@ class OpenClawSmartRouterPlugin:
         :return: 重定向配置，交由宿主执行网络请求
         """
         messages = request_data.get("messages", [])
-        prompt = messages[-1].get("content", "") if messages else ""
+        raw_content = messages[-1].get("content", "") if messages else ""
+        prompt = _extract_text_from_content(raw_content)
+        content_types = _detect_content_types(messages)
+        has_multimodal = any(t != "text" for t in content_types)
         request_data["prompt"] = prompt  # 供 after_llm_call 使用
+        request_data["_content_types"] = content_types
 
-        # 1. 缓存命中
-        prompt_hash = hashlib.md5(prompt.encode("utf-8")).hexdigest()
+        # 1. 缓存命中（多模态请求不使用缓存）
+        prompt_hash = hashlib.md5(prompt.encode("utf-8")).hexdigest() if not has_multimodal else ""
         cached_model = self.router.get_cached_route(prompt_hash)
         if cached_model:
             request_data["_cached"] = True
@@ -84,11 +129,24 @@ class OpenClawSmartRouterPlugin:
         request_data["_task_type"] = task_type
 
         # 4. 智能路由
-        selected = self.router.select_model(diff, est_tok, est_tok, task_type=task_type)
+        selected = self.router.select_model(diff, est_tok, est_tok, task_type=task_type, content_types=content_types)
         if not selected:
-            # 降级到默认模型
+            # 降级：按综合评分依次尝试能力较低的模型
+            fallback_chain = self.router.select_fallback_chain(
+                diff, est_tok, est_tok,
+                failed_models=[],
+                task_type=task_type,
+                strict_capability=False,
+                content_types=content_types,
+            )
+            for candidate in fallback_chain:
+                if pricing_manager.is_within_active_hours(candidate.get("active_hours")):
+                    selected = candidate
+                    break
+        if not selected:
+            # 最终兜底
             default = config.get_default_model()
-            if default:
+            if default and pricing_manager.is_within_active_hours(default.get("active_hours")):
                 selected = default
             else:
                 return {}
@@ -143,7 +201,8 @@ class OpenClawSmartRouterPlugin:
                 self.pricing.deduct(selected_name, cost)
 
         # 记录日志
-        prompt_hash = hashlib.md5(prompt.encode("utf-8")).hexdigest()
+        prompt_str = prompt if isinstance(prompt, str) else str(prompt)
+        prompt_hash = hashlib.md5(prompt_str.encode("utf-8")).hexdigest()
         latency_ms = int(response.get("_latency_ms", 0))
         success = response.get("_success", True)
         self.db.log_request(

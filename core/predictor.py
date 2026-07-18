@@ -60,8 +60,13 @@ class OnlinePredictor:
             self._clf = None
             self._reg = None
 
-        # 加载 ONNX 静态特征提取器
-        self._load_embedder()
+        # ONNX 异步加载：先启动降级模式，后台线程加载 ONNX 模型
+        self._onnx_loading = True
+        self._onnx_loaded = False
+        _onnx_thread = threading.Thread(
+            target=self._async_load_embedder, daemon=True, name="onnx-loader"
+        )
+        _onnx_thread.start()
 
         # 训练队列 + 后台线程
         self._train_queue: "queue.Queue[tuple]" = queue.Queue()
@@ -79,6 +84,14 @@ class OnlinePredictor:
     # ------------------------------------------------------------------ #
     # ONNX 加载
     # ------------------------------------------------------------------ #
+    def _async_load_embedder(self) -> None:
+        """后台线程异步加载 ONNX 模型，加载完成前使用降级模式。"""
+        try:
+            self._load_embedder()
+        finally:
+            self._onnx_loading = False
+            self._onnx_loaded = self._embedder is not None
+
     def _load_embedder(self) -> None:
         if not _HAS_ONNX:
             print(
@@ -134,6 +147,9 @@ class OnlinePredictor:
 
     def _hash_embedding(self, prompt: str, dim: int = 384) -> np.ndarray:
         """哈希降级特征：稳定、零依赖。"""
+        # 防御性检查
+        if not isinstance(prompt, str):
+            prompt = str(prompt) if prompt is not None else ""
         vec = np.zeros((1, dim), dtype=np.float32)
         # 字符 n-gram 哈希
         text = prompt.lower()
@@ -154,6 +170,10 @@ class OnlinePredictor:
     def predict(self, prompt: str) -> Tuple[int, int]:
         """同步预测难度(1-100)与预估输出 Token 数。"""
         t0 = time.perf_counter()
+
+        # 防御性检查：确保 prompt 是字符串（多模态请求中 content 可能是 list）
+        if not isinstance(prompt, str):
+            prompt = str(prompt) if prompt is not None else ""
 
         # 缓存命中
         cache_key = hashlib.md5(prompt.encode("utf-8")).hexdigest()
@@ -317,6 +337,7 @@ class OnlinePredictor:
             "is_ready": self._is_initialized,
             "queue_size": self._train_queue.qsize(),
             "has_onnx": self._embedder is not None,
+            "onnx_loading": self._onnx_loading,
             "has_sklearn": self._clf is not None,
             "onnx_path": self._onnx_path,
             "cache_size": len(self._cache),

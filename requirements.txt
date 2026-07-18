@@ -15,8 +15,8 @@ python-jose[cryptography]>=3.3.0
 python-multipart>=0.0.6
 
 # 可选：ONNX 模型下载与转换（开发时使用）
-# transformers==4.44.2
-# torch==2.4.1
-# requests
-# onnx
-# onnxscript
+transformers==4.44.2
+torch==2.4.1
+requests
+onnx
+onnxscript

@@ -9,11 +9,17 @@ core/config.py
 
 from __future__ import annotations
 
+import copy
+import logging
 import os
+import shutil
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import yaml
+
+logger = logging.getLogger(__name__)
 
 
 class ConfigError(Exception):
@@ -88,15 +94,181 @@ class Config:
     # ------------------------------------------------------------------ #
     # 加载与持久化
     # ------------------------------------------------------------------ #
-    def reload(self) -> None:
-        """重新从磁盘读取 config.yaml。"""
+    # 备份目录
+    _BACKUP_DIR_NAME = "config_backups"
+    _MAX_BACKUPS = 10
+
+    def _backup_dir(self) -> Path:
+        return self._config_path.parent / self._BACKUP_DIR_NAME
+
+    def _ensure_backup_dir(self) -> Path:
+        d = self._backup_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def backup(self, reason: str = "manual") -> Optional[Path]:
+        """创建配置文件备份。
+
+        :param reason: 备份原因标记，用于文件名
+        :return: 备份文件路径，失败返回 None
+        """
         if not self._config_path.exists():
-            raise ConfigError(f"配置文件不存在: {self._config_path}")
-        with open(self._config_path, "r", encoding="utf-8") as f:
-            self._data = yaml.safe_load(f) or {}
+            return None
+        try:
+            backup_dir = self._ensure_backup_dir()
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            backup_name = f"config_{ts}_{reason}.yaml"
+            backup_path = backup_dir / backup_name
+            shutil.copy2(self._config_path, backup_path)
+            # 清理旧备份，只保留最近 _MAX_BACKUPS 个
+            backups = sorted(backup_dir.glob("config_*.yaml"), reverse=True)
+            for old in backups[self._MAX_BACKUPS:]:
+                old.unlink(missing_ok=True)
+            logger.info("配置备份已创建: %s (原因: %s)", backup_path.name, reason)
+            return backup_path
+        except Exception as e:
+            logger.warning("配置备份失败: %s", e)
+            return None
+
+    def _find_latest_backup(self) -> Optional[Path]:
+        """查找最新的有效备份文件。"""
+        backup_dir = self._backup_dir()
+        if not backup_dir.exists():
+            return None
+        backups = sorted(backup_dir.glob("config_*.yaml"), reverse=True)
+        for bp in backups:
+            try:
+                with open(bp, "r", encoding="utf-8") as f:
+                    data = yaml.safe_load(f)
+                if data and isinstance(data, dict):
+                    return bp
+            except Exception:
+                continue
+        return None
+
+    def _repair_config(self, raw_data: Any) -> Dict[str, Any]:
+        """尝试修复配置数据中的常见错误。
+
+        :param raw_data: yaml.safe_load 的原始结果
+        :return: 修复后的配置字典
+        """
+        # 情况1: 完全为空 -> 返回最小有效配置
+        if raw_data is None:
+            logger.warning("配置文件为空，使用最小默认配置")
+            return {"models": [], "providers": [], "admin_password": "admin"}
+
+        # 情况2: 不是字典 -> 尝试包装或回退
+        if not isinstance(raw_data, dict):
+            logger.warning("配置文件格式异常（非字典），使用最小默认配置")
+            return {"models": [], "providers": [], "admin_password": "admin"}
+
+        data = dict(raw_data)
+
+        # 情况3: models 不是列表 -> 修复
+        if "models" not in data:
+            data["models"] = []
+        elif not isinstance(data["models"], list):
+            logger.warning("models 字段不是列表，已重置为空列表")
+            data["models"] = []
+
+        # 情况4: providers 不是列表 -> 修复
+        if "providers" not in data:
+            data["providers"] = []
+        elif not isinstance(data["providers"], list):
+            logger.warning("providers 字段不是列表，已重置为空列表")
+            data["providers"] = []
+
+        # 情况5: 修复模型配置中缺少 name 字段的条目
+        valid_models = []
+        for i, m in enumerate(data["models"]):
+            if not isinstance(m, dict):
+                logger.warning("models[%d] 不是字典，已跳过", i)
+                continue
+            if "name" not in m or not m["name"]:
+                logger.warning("models[%d] 缺少 name 字段，已跳过", i)
+                continue
+            valid_models.append(m)
+        data["models"] = valid_models
+
+        # 情况6: 修复 provider 配置中缺少 name 字段的条目
+        valid_providers = []
+        for i, p in enumerate(data["providers"]):
+            if not isinstance(p, dict):
+                logger.warning("providers[%d] 不是字典，已跳过", i)
+                continue
+            if "name" not in p or not p["name"]:
+                logger.warning("providers[%d] 缺少 name 字段，已跳过", i)
+                continue
+            valid_providers.append(p)
+        data["providers"] = valid_providers
+
+        # 情况7: 确保关键字段存在
+        if "admin_password" not in data:
+            data["admin_password"] = "admin"
+        if "currency" not in data:
+            data["currency"] = "CNY"
+
+        return data
+
+    def reload(self) -> None:
+        """重新从磁盘读取 config.yaml，带错误自动修复和备份恢复。
+
+        加载策略：
+        1. 尝试读取并解析 config.yaml
+        2. 如果 YAML 语法错误 -> 尝试从最新备份恢复
+        3. 如果解析成功但数据异常 -> 自动修复
+        4. 如果文件不存在 -> 尝试从备份恢复，否则创建最小配置
+        """
+        # 文件不存在时的处理
+        if not self._config_path.exists():
+            logger.error("配置文件不存在: %s", self._config_path)
+            backup = self._find_latest_backup()
+            if backup:
+                logger.info("从备份恢复配置: %s", backup.name)
+                shutil.copy2(backup, self._config_path)
+                # 读取恢复后的文件
+                with open(self._config_path, "r", encoding="utf-8") as f:
+                    raw_data = yaml.safe_load(f)
+                self._data = self._repair_config(raw_data)
+            else:
+                logger.warning("无可用备份，创建最小默认配置")
+                self._data = {"models": [], "providers": [], "admin_password": "admin", "currency": "CNY"}
+                self.save()
+            return
+
+        # 尝试读取和解析
+        try:
+            with open(self._config_path, "r", encoding="utf-8") as f:
+                raw_data = yaml.safe_load(f)
+        except yaml.YAMLError as e:
+            logger.error("配置文件 YAML 语法错误: %s", e)
+            # 先备份损坏的文件
+            try:
+                corrupt_backup = self._config_path.parent / f"config_corrupt_{time.strftime('%Y%m%d_%H%M%S')}.yaml"
+                shutil.copy2(self._config_path, corrupt_backup)
+                logger.info("损坏的配置已备份到: %s", corrupt_backup.name)
+            except Exception:
+                pass
+            # 尝试从备份恢复
+            backup = self._find_latest_backup()
+            if backup:
+                logger.info("从备份恢复配置: %s", backup.name)
+                shutil.copy2(backup, self._config_path)
+                with open(self._config_path, "r", encoding="utf-8") as f:
+                    raw_data = yaml.safe_load(f)
+            else:
+                logger.warning("无可用备份，使用最小默认配置")
+                self._data = {"models": [], "providers": [], "admin_password": "admin", "currency": "CNY"}
+                return
+
+        # 自动修复配置数据
+        self._data = self._repair_config(raw_data)
 
     def save(self) -> None:
-        """将内存中的配置写回 config.yaml。"""
+        """将内存中的配置写回 config.yaml，保存前自动备份。"""
+        # 保存前先备份当前文件
+        if self._config_path.exists():
+            self.backup(reason="auto_before_save")
         try:
             with open(self._config_path, "w", encoding="utf-8") as f:
                 yaml.safe_dump(self._data, f, allow_unicode=True, sort_keys=False)
@@ -171,13 +343,94 @@ class Config:
     # ------------------------------------------------------------------ #
     # 业务相关便捷方法
     # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------ #
+    # Provider（提供方）管理
+    # ------------------------------------------------------------------ #
+    def get_providers(self) -> List[Dict[str, Any]]:
+        """返回提供方列表，自动补全默认值。"""
+        providers = self._data.get("providers", [])
+        enriched: List[Dict[str, Any]] = []
+        for p in providers:
+            # 防御性检查：跳过无效 provider 配置
+            if not isinstance(p, dict) or not p.get("name"):
+                continue
+            item = dict(p)
+            # 环境变量覆盖 Provider API Key
+            env_key = f"SMARTROUTER_PROVIDER_API_KEY_{p['name'].upper().replace('-', '_').replace('.', '_')}"
+            if env_key in os.environ:
+                item["api_key"] = os.environ[env_key]
+            # 默认值
+            if "display_name" not in item:
+                item["display_name"] = item.get("name", "")
+            if "api_type" not in item:
+                item["api_type"] = "openai"
+            if "base_url" not in item:
+                item["base_url"] = ""
+            if "api_key" not in item:
+                item["api_key"] = ""
+            if "balance_script" not in item:
+                item["balance_script"] = ""
+            if "price_script" not in item:
+                item["price_script"] = ""
+            if "balance_manual" not in item:
+                item["balance_manual"] = None
+            if "balance_currency" not in item:
+                item["balance_currency"] = "CNY"
+            enriched.append(item)
+        return enriched
+
+    def get_provider(self, name: str) -> Optional[Dict[str, Any]]:
+        """按名称获取提供方配置。"""
+        for p in self.get_providers():
+            if p["name"] == name:
+                return p
+        return None
+
     def get_models(self) -> List[Dict[str, Any]]:
-        """返回模型列表，并对 API Key 做环境变量覆盖，自动计算 capability。"""
+        """返回模型列表，合并 Provider 配置，并对 API Key 做环境变量覆盖，自动计算 capability。
+
+        优先级（从高到低）：
+        1. 模型自身的字段（如 api_key、base_url）
+        2. 关联 Provider 的字段
+        3. 环境变量覆盖
+        4. 默认值
+        """
+        providers_map = {p["name"]: p for p in self.get_providers()}
         models = self._data.get("models", [])
         enriched: List[Dict[str, Any]] = []
         for m in models:
+            # 防御性检查：跳过无效模型配置
+            if not isinstance(m, dict) or not m.get("name"):
+                continue
             item = dict(m)
-            # 环境变量覆盖 API Key
+            # 合并 Provider 配置：模型自身字段优先，Provider 字段作为兜底
+            # 继承规则：模型字段为空/空字符串时，使用 Provider 的值
+            provider_name = m.get("provider", "")
+            provider = providers_map.get(provider_name) if provider_name else None
+            if provider:
+                # Provider 字段作为兜底（模型未设置或为空时使用 Provider 的值）
+                if not item.get("base_url") and provider.get("base_url"):
+                    item["base_url"] = provider["base_url"]
+                if not item.get("api_key") and provider.get("api_key"):
+                    item["api_key"] = provider["api_key"]
+                if not item.get("api_type") and provider.get("api_type"):
+                    item["api_type"] = provider["api_type"]
+                # 标记模型是否在配置中显式设置了 api_key（用于前端区分"继承"和"自有"）
+                item["_api_key_inherited"] = not m.get("api_key")
+                # 记录 Provider 信息供前端和余额查询使用
+                item["_provider"] = {
+                    "name": provider["name"],
+                    "display_name": provider.get("display_name", provider["name"]),
+                    "api_key": provider.get("api_key", ""),
+                    "base_url": provider.get("base_url", ""),
+                    "api_type": provider.get("api_type", "openai"),
+                    "provider_type": provider.get("provider_type", ""),
+                    "balance_script": provider.get("balance_script", ""),
+                    "price_script": provider.get("price_script", ""),
+                    "balance_manual": provider.get("balance_manual"),
+                    "balance_currency": provider.get("balance_currency", "CNY"),
+                }
+            # 环境变量覆盖 API Key（模型级）
             env_key = f"SMARTROUTER_API_KEY_{m['name'].upper().replace('-', '_').replace('.', '_')}"
             if env_key in os.environ:
                 item["api_key"] = os.environ[env_key]
@@ -189,6 +442,15 @@ class Config:
             # 确保 task_types 存在
             if "task_types" not in item or item["task_types"] is None:
                 item["task_types"] = []
+            # 确保 modalities 存在（模型支持的模态列表，如 ["text", "image", "audio", "video"]）
+            if "modalities" not in item or item["modalities"] is None:
+                item["modalities"] = []
+            # 确保 pending_modalities 存在（待确认的模态检测结果）
+            if "pending_modalities" not in item or item["pending_modalities"] is None:
+                item["pending_modalities"] = None
+            # 确保 pending_modalities_detected_at 存在（待确认模态的检测时间戳）
+            if "pending_modalities_detected_at" not in item or item["pending_modalities_detected_at"] is None:
+                item["pending_modalities_detected_at"] = None
             # 默认 price_unit 为 1M（每百万token）
             if "price_unit" not in item:
                 item["price_unit"] = "1M"
@@ -207,6 +469,14 @@ class Config:
             # 默认启用模型
             if "enabled" not in item:
                 item["enabled"] = True
+            # 默认全天生效（null/空字符串/空列表表示全天）
+            if "active_hours" not in item:
+                item["active_hours"] = None
+            # 默认无模型级脚本
+            if "balance_script" not in item:
+                item["balance_script"] = ""
+            if "price_script" not in item:
+                item["price_script"] = ""
             enriched.append(item)
         return enriched
 

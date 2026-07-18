@@ -1,15 +1,20 @@
 # =====================================================================
-# OpenClaw SmartRouter docker-compose.yml
+# SmartRouter v2.0 docker-compose.yml
 # =====================================================================
 # 一键启动：
 #   cp .env.example .env   # 首次使用，编辑 .env 填入 API Key
-#   docker compose up -d
+#   docker compose up -d --build
 # 查看日志：
 #   docker compose logs -f
 # 停止：
 #   docker compose down
+# 重新构建：
+#   docker compose up -d --build
 #
-# 所有用户可配置的环境变量均在 .env 文件中管理
+# 数据持久化说明：
+#   - 数据库: ./data/smart_router.db (SQLite, 自动创建)
+#   - 模型文件: ./data/models/ (ONNX/joblib/JSON, 首次启动从镜像复制)
+#   - 配置文件: ./config.yaml
 # =====================================================================
 
 services:
@@ -17,40 +22,34 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: han/smart-router:1.0.0
-    container_name: ai-smart-router
+    image: han/smart-router:2.0.0
+    container_name: smart-router
     restart: unless-stopped
     ports:
       - "${SMARTROUTER_PORT:-8000}:8000"
-    # 从 .env 文件读取所有用户配置的环境变量
     env_file:
       - path: .env
         required: false
-    # 仅保留容器内部固定配置（不属于用户配置项）
     environment:
       SMARTROUTER_HOST: "0.0.0.0"
-      SMARTROUTER_DB_PATH: "/app/data/smart_router.db"
+      TZ: "Asia/Shanghai"
     volumes:
-      # 数据库持久化
-      - smart-router-data:/app/data
+      # 数据库持久化 (SQLite默认路径: /app/data/smart_router.db)
+      - ./data:/app/data
       # 配置文件挂载（读写，支持 Web 面板在线修改并持久化）
       - ./config.yaml:/app/config.yaml
-      # .env 文件挂载（读写，Web 修改密码/API Key 时同步更新，确保重启后生效）
+      # .env 文件挂载（可选，确保 Web 修改密码/API Key 重启后生效）
       - ./.env:/app/.env
-      # ONNX 模型挂载（可选）
-      - ./models:/app/models:ro
+      # ONNX 模型挂载（持久化，首次启动自动从镜像内复制标准模型）
+      - ./data/models:/app/data/models
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 10s
+      start_period: 15s
     networks:
       - smart-router-net
-
-volumes:
-  smart-router-data:
-    driver: local
 
 networks:
   smart-router-net:
